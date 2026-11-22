@@ -417,6 +417,13 @@ fn use_model(
     language: Option<&str>,
     install: bool,
 ) -> Result<ControlReply, ControlError> {
+    #[cfg(target_os = "windows")]
+    if crate::transcription::snapdragon::configured() {
+        return Err(ControlError::new(
+            "unsupported",
+            "this Hex is configured for Snapdragon QNN; restart without HEX_SNAPDRAGON_WORKER to switch models",
+        ));
+    }
     let selection = super::model_selection(&load()?, model, language)?;
     let definition = crate::transcription::models::definition(selection.model);
     let installed = crate::transcription::models::is_installed(definition, &selection.language);
@@ -536,6 +543,15 @@ fn launch_at_login(host: &dyn Host, enabled: Option<bool>) -> ControlReply {
 fn status(host: &dyn Host) -> Result<ControlReply, ControlError> {
     let state = host.state()?;
     let settings = &state.settings;
+    #[cfg(target_os = "windows")]
+    let snapdragon = crate::transcription::snapdragon::configured();
+    #[cfg(target_os = "windows")]
+    let ready = if snapdragon {
+        state.transcription.backend.is_some()
+    } else {
+        crate::desktop::onboarding::model_ready(&settings.transcription)
+    };
+    #[cfg(not(target_os = "windows"))]
     let ready = crate::desktop::onboarding::model_ready(&settings.transcription);
     let capture = if state.listener.running {
         match host.capture() {
@@ -551,6 +567,39 @@ fn status(host: &dyn Host) -> Result<ControlReply, ControlError> {
             ..Default::default()
         }
     };
+    #[cfg(target_os = "windows")]
+    let snapdragon_report = snapdragon.then(|| {
+        let model = state.transcription.snapdragon.as_ref();
+        ModelReport {
+            name: model.map_or("Snapdragon QNN", |model| model.name()).into(),
+            id: model.map(|model| model.model.clone()).unwrap_or_default(),
+            language: model.map_or_else(crate::transcription::snapdragon::language, |model| {
+                model.language.clone()
+            }),
+            installed: ready,
+            error: state
+                .transcription
+                .error
+                .clone()
+                .or_else(|| state.listener.last_failure.clone()),
+            backend: state.transcription.backend.clone(),
+            ..ModelReport::default()
+        }
+    });
+    let saved = || ModelReport {
+        preparing: state
+            .transcription
+            .preparing
+            .map(|model| model.as_str().into()),
+        downloaded_bytes: state.transcription.downloaded_bytes,
+        error: state.transcription.error.clone(),
+        backend: state.transcription.backend.clone(),
+        ..ModelReport::saved(&settings.transcription)
+    };
+    #[cfg(target_os = "windows")]
+    let model = snapdragon_report.unwrap_or_else(saved);
+    #[cfg(not(target_os = "windows"))]
+    let model = saved();
     Ok(ControlReply::Status(Box::new(StatusReport {
         app_version: crate::VERSION.into(),
         pid: std::process::id(),
@@ -579,16 +628,7 @@ fn status(host: &dyn Host) -> Result<ControlReply, ControlError> {
         },
         capture,
         meeting: meeting_report(),
-        model: ModelReport {
-            preparing: state
-                .transcription
-                .preparing
-                .map(|model| model.as_str().into()),
-            downloaded_bytes: state.transcription.downloaded_bytes,
-            error: state.transcription.error.clone(),
-            backend: state.transcription.backend.clone(),
-            ..ModelReport::saved(&settings.transcription)
-        },
+        model,
         features: FeatureReport {
             meetings: crate::app_settings::meetings_enabled(),
             release_microphone_while_idle: settings.release_microphone_while_idle,
@@ -653,6 +693,8 @@ mod tests {
                     selection: Default::default(),
                     preparing: None,
                     backend: self.backend.clone(),
+                    #[cfg(target_os = "windows")]
+                    snapdragon: None,
                 },
                 update: DesktopUpdateStatus::Current,
                 window_open: false,

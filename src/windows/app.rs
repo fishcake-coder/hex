@@ -292,8 +292,15 @@ impl WindowsDesktopHost {
     /// Setup is ready, so the tour's practice can dictate, or the tour
     /// finished without a model.
     fn setup_done(&self) -> bool {
-        crate::desktop::onboarding::status(&self.settings.transcription).ready()
-            || crate::desktop::onboarding::completion_recorded()
+        // The launcher provisions the QNN model. The listener verifies that
+        // it can run and publishes any failure itself.
+        use crate::desktop::onboarding;
+        let status = if crate::transcription::snapdragon::configured() {
+            onboarding::status_with_transcription_model(true)
+        } else {
+            onboarding::status(&self.settings.transcription)
+        };
+        status.ready() || onboarding::completion_recorded()
     }
 
     /// Handles one window or tray request; returns `true` when Hex should quit.
@@ -369,6 +376,9 @@ impl WindowsDesktopHost {
     }
 
     fn choose_model(&mut self, model: TranscriptionModelId, language: String) {
+        if crate::transcription::snapdragon::configured() {
+            return;
+        }
         self.manual_choice();
         let selection = crate::transcription::models::TranscriptionSelection { model, language };
         self.preparation.start(selection, false);
@@ -405,6 +415,9 @@ impl WindowsDesktopHost {
     /// Follows the focused window's layout while switching is on, and starts
     /// the installed-only preparation of a mapping once it is due.
     fn switch_with_keyboard(&mut self) {
+        if crate::transcription::snapdragon::configured() {
+            return;
+        }
         let enabled = self.settings.keyboard_model_switching.enabled;
         if enabled != self.input_sources.is_some() {
             self.input_sources = enabled.then(Default::default);
@@ -452,7 +465,8 @@ impl WindowsDesktopHost {
     /// host cannot see a listener recording, so a due switch is held only
     /// while the shared engine's dictation streams or finishes run.
     fn switch_with_app(&mut self) {
-        if !self.settings.labs.app_model_switching {
+        if crate::transcription::snapdragon::configured() || !self.settings.labs.app_model_switching
+        {
             return;
         }
         let application = foreground_other_process_stem();
@@ -491,6 +505,9 @@ impl WindowsDesktopHost {
     }
 
     fn model_ready(&self) -> bool {
+        if crate::transcription::snapdragon::configured() {
+            return true;
+        }
         let selection = self.runtime_selection();
         let model = crate::transcription::models::definition(selection.model);
         crate::transcription::models::is_installed(model, &selection.language)
@@ -651,6 +668,9 @@ impl WindowsDesktopHost {
     /// The saved selection, or the default model while it names an import
     /// that can't run.
     fn runtime_selection(&self) -> crate::transcription::models::TranscriptionSelection {
+        if crate::transcription::snapdragon::configured() {
+            return self.settings.transcription.clone();
+        }
         crate::transcription::custom_models::runnable(&self.settings.transcription)
     }
 
@@ -805,6 +825,7 @@ impl WindowsDesktopHost {
 
     pub(crate) fn publish(&self) -> Published {
         let preparation = self.preparation.status();
+        let engine = crate::transcription::engine::TranscriptionEngine::shared();
         Published {
             activity: self.activity.state,
             listener: DesktopListenerSnapshot {
@@ -822,14 +843,20 @@ impl WindowsDesktopHost {
             operation_error: self.error.clone(),
             transcription: DesktopTranscriptionSnapshot {
                 downloaded_bytes: preparation.downloaded_bytes,
-                error: preparation.error,
+                error: if crate::transcription::snapdragon::configured()
+                    && self.status == ListenerStatus::CouldNotEnable
+                {
+                    self.error.clone()
+                } else {
+                    preparation.error
+                },
                 preparation_stage: preparation.stage,
                 selection: self.settings.transcription.clone(),
                 preparing: preparation.model,
                 // The listener shares its engine with this process, so its
                 // last finished command says where the model runs.
-                backend: crate::transcription::engine::TranscriptionEngine::shared()
-                    .and_then(|engine| engine.held_backend()),
+                backend: engine.as_ref().and_then(|engine| engine.held_backend()),
+                snapdragon: engine.and_then(|engine| engine.held_snapdragon()),
             },
             update_status: self.updater.status(),
             update_notes: self.updater.notes(),

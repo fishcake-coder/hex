@@ -29,6 +29,9 @@ pub(crate) struct DesktopTranscriptionSnapshot {
     /// unloaded, and on macOS, which `hex status` leaves out.
     #[serde(default)]
     pub(crate) backend: Option<crate::transcription::SpeechBackend>,
+    #[cfg(target_os = "windows")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) snapdragon: Option<crate::transcription::snapdragon::Identity>,
 }
 
 /// What the listener card and `hex status` say the listener is doing, on

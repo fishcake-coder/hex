@@ -46,6 +46,10 @@ impl Tour {
 
     /// The tour when this run still needs it.
     pub(super) fn start(settings: &AppSettings, platform: &PlatformState) -> Option<Tour> {
+        #[cfg(target_os = "windows")]
+        if crate::transcription::snapdragon::configured() {
+            return None;
+        }
         let installed = super::picker::Picker::default().selected_installed(settings);
         let status = platform.setup_status(installed);
         let completed = crate::desktop::onboarding::completion_recorded();

@@ -29,6 +29,8 @@ pub(crate) mod pieces;
 #[cfg(any(target_os = "macos", target_os = "windows", test))]
 pub(crate) mod preparation;
 pub(crate) mod service;
+#[cfg(target_os = "windows")]
+pub(crate) mod snapdragon;
 pub(crate) mod speech_detector;
 pub(crate) mod stream;
 pub(crate) mod stream_tuning;

@@ -16,6 +16,9 @@ every timing, input, or recovery guarantee; see the
 verified end-to-end driver. Linked checks are locators; no tests or previews
 were run for this rewrite.
 
+Windows ARM64 can use the opt-in [Snapdragon QNN speech engine](snapdragon-qnn.md)
+with the normal shortcut and the same Windows paste and History pipeline.
+
 ## How To Get To It
 
 Settings shortcut capture persists the candidate before showing Saved. If the

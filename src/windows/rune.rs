@@ -685,11 +685,15 @@ fn tray_view_for(published: &Published, dictation_audio: Option<bool>) -> TrayVi
             published.listener.running,
             published.state,
             &published.update_status,
-            crate::desktop::tray_menu::model_menu_entries(
-                &published.settings,
-                published.transcription.preparing.is_some(),
-                crate::transcription::models::is_installed,
-            ),
+            if crate::transcription::snapdragon::configured() {
+                Vec::new()
+            } else {
+                crate::desktop::tray_menu::model_menu_entries(
+                    &published.settings,
+                    published.transcription.preparing.is_some(),
+                    crate::transcription::models::is_installed,
+                )
+            },
         )
     }
 }

@@ -1,4 +1,4 @@
-//! The thread that owns the loaded GGUF model and runs all of its inference.
+//! The thread that owns the loaded speech model and runs all of its inference.
 //!
 //! A capture that the model can stream is fed while the shortcut is held, so
 //! release only decodes the last second or two of audio. Every finish carries
@@ -7,9 +7,10 @@
 //! that cannot stream always takes the offline path. Commands are handled in
 //! order on one thread, because a live stream holds the model's compute lease.
 
-use std::collections::VecDeque;
+mod shared_model;
 mod streaming;
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -19,14 +20,20 @@ use std::time::{Duration, Instant};
 use color_eyre::eyre::{Result, eyre};
 use transcribe_cpp::CancelToken;
 
-/// The model the engine owns: macOS keeps its warm, switchable transcriber
+pub(crate) use shared_model::{
+    HeldModel, dictation_busy, held, timestamp_level, transcribe_clip, transcribe_clip_timed,
+};
 use streaming::*;
 
-/// (GGUF or Apple Speech); Linux and Windows load one GGUF model.
+/// The model owned by the inference thread on each platform.
 #[cfg(target_os = "macos")]
 pub(crate) type Model = crate::transcription::WarmTranscriber;
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 pub(crate) type Model = crate::transcription::local_transcriber::LocalTranscriber;
+#[cfg(target_os = "windows")]
+mod windows_model;
+#[cfg(target_os = "windows")]
+pub(crate) use windows_model::Model;
 
 /// Transcribes a complete 16 kHz clip offline on the engine thread.
 pub(crate) type Offline = Box<dyn FnOnce(&mut Model, Vec<f32>) -> Result<String, String> + Send>;
@@ -335,6 +342,8 @@ enum Reply {
 #[derive(Debug)]
 pub struct Transcribed {
     pub text: String,
+    #[cfg(target_os = "windows")]
+    pub(crate) language: Option<String>,
     pub source: Source,
     /// Time from the finish request to the final text.
     pub finish_ms: u64,
@@ -415,6 +424,8 @@ pub struct TranscriptionEngine {
 #[derive(Clone, Default)]
 struct HeldSnapshot {
     selection: Option<crate::transcription::models::TranscriptionSelection>,
+    #[cfg(target_os = "windows")]
+    snapdragon: Option<crate::transcription::snapdragon::Identity>,
     backend: Option<crate::transcription::SpeechBackend>,
 }
 
@@ -573,8 +584,10 @@ impl TranscriptionEngine {
         let requests = Arc::new(AtomicU64::new(0));
         let running = Running::default();
         let stalled = Arc::new(AtomicBool::new(false));
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
         let backend = model.as_ref().map(|model| model.backend().clone());
+        #[cfg(target_os = "windows")]
+        let backend = model.as_ref().and_then(Model::backend).cloned();
         #[cfg(target_os = "macos")]
         let backend = None;
         let held = Held::new(Mutex::new(HeldSnapshot {
@@ -582,6 +595,8 @@ impl TranscriptionEngine {
                 .as_ref()
                 .and_then(|model| model.gguf_selection().cloned())
                 .or_else(|| parked.clone()),
+            #[cfg(target_os = "windows")]
+            snapdragon: model.as_ref().and_then(Model::snapdragon_identity).cloned(),
             backend,
         }));
         let dictating = Arc::new(AtomicBool::new(false));
@@ -743,8 +758,11 @@ impl TranscriptionEngine {
                 // Labs › Skip long pauses, asked as the run starts, then
                 // padding that follows the cut rather than being trimmed by
                 // a trailing pause (#1629).
-                let clip =
-                    padded_whole_clip(clip, crate::labs::skip_pauses(), Some(model.model_id()));
+                #[cfg(target_os = "linux")]
+                let model_id = Some(model.model_id());
+                #[cfg(target_os = "windows")]
+                let model_id = model.model_id();
+                let clip = padded_whole_clip(clip, crate::labs::skip_pauses(), model_id);
                 model
                     .transcribe(&clip)
                     .map_err(|error| format!("{error:#}"))
@@ -867,19 +885,6 @@ impl TranscriptionEngine {
         }
     }
 
-    /// Makes this the engine that meeting transcription and the local API share.
-    pub fn share(self: &Arc<Self>) {
-        *SHARED.lock().unwrap_or_else(|error| error.into_inner()) = Arc::downgrade(self);
-    }
-
-    /// The running app's engine, when one is shared.
-    pub fn shared() -> Option<Arc<Self>> {
-        SHARED
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .upgrade()
-    }
-
     /// Whether the model holds the GGUF `selection` as of its last finished
     /// command. Readable while dictation runs, unlike the model itself.
     pub(crate) fn holds(
@@ -917,6 +922,15 @@ impl TranscriptionEngine {
             .clone()
     }
 
+    #[cfg(target_os = "windows")]
+    pub(crate) fn held_snapdragon(&self) -> Option<crate::transcription::snapdragon::Identity> {
+        self.held
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .snapdragon
+            .clone()
+    }
+
     /// Why a live stream cannot open for a capture, when it can't: the
     /// model's own definition doesn't stream, or it streams in principle but
     /// not on the device it loaded on (a CPU, or a GPU whose stream probe
@@ -924,6 +938,10 @@ impl TranscriptionEngine {
     pub(crate) fn stream_refusal(&self) -> Option<&'static str> {
         if self.streams.load(Ordering::Acquire) {
             return None;
+        }
+        #[cfg(target_os = "windows")]
+        if self.held_snapdragon().is_some() {
+            return Some("the Snapdragon speech model takes finished audio clips");
         }
         match self.held_selection() {
             Some(selection) => {
@@ -974,70 +992,6 @@ fn reload(selection: &crate::transcription::models::TranscriptionSelection) -> R
 fn publish_out_of_memory(_model: &Model) {
     #[cfg(not(target_os = "macos"))]
     crate::transcription::gpu_health::set_out_of_memory(_model.out_of_memory());
-}
-
-static SHARED: std::sync::Mutex<std::sync::Weak<TranscriptionEngine>> =
-    std::sync::Mutex::new(std::sync::Weak::new());
-
-/// Whether dictation is capturing or transcribing, so host audio and
-/// background work give way to it. macOS counts a capture from its press;
-/// Linux and Windows count the shared engine's dictation streams and finishes.
-pub(crate) fn dictation_busy() -> bool {
-    #[cfg(target_os = "macos")]
-    let capturing = crate::parakeet::dictation_busy();
-    #[cfg(not(target_os = "macos"))]
-    let capturing = false;
-    capturing
-        || TranscriptionEngine::shared()
-            .is_some_and(|engine| engine.dictating.load(Ordering::Acquire))
-}
-
-/// A model the engine can hold: the GGUF transcriber on macOS, the one local
-/// GGUF model on Linux and Windows.
-#[cfg(target_os = "macos")]
-pub(crate) type HeldModel = crate::transcription::Transcriber;
-#[cfg(not(target_os = "macos"))]
-pub(crate) type HeldModel = crate::transcription::local_transcriber::LocalTranscriber;
-
-/// The engine's model when it is the GGUF `selection`, never loading or
-/// switching one.
-pub(crate) fn held<'a>(
-    model: &'a mut Model,
-    selection: &crate::transcription::models::TranscriptionSelection,
-) -> Option<&'a mut HeldModel> {
-    #[cfg(target_os = "macos")]
-    let model = model
-        .active()
-        .filter(|model| matches!(model, crate::transcription::Transcriber::Gguf(_)))?;
-    model.matches_selection(selection).then_some(model)
-}
-
-/// Transcribes a complete 16 kHz clip with a held model, padded as a
-/// dictation's clip is.
-pub(crate) fn transcribe_clip(model: &mut HeldModel, samples: Vec<f32>) -> Result<String> {
-    #[cfg(target_os = "macos")]
-    return model.transcribe(samples);
-    #[cfg(not(target_os = "macos"))]
-    model.transcribe_clip(samples)
-}
-
-/// Transcribes a complete 16 kHz clip with a held model and its own native
-/// timings, never estimated ones.
-pub(crate) fn transcribe_clip_timed(
-    model: &mut HeldModel,
-    samples: Vec<f32>,
-) -> Result<crate::transcription::transcript::Transcript, String> {
-    model
-        .transcribe_timed(samples)
-        .map_err(|error| format!("{error:#}"))
-}
-
-/// The finest native timings a held model gives. Dictation never asks; the
-/// local API answers `422` for a level the model cannot produce.
-pub(crate) fn timestamp_level(
-    model: &HeldModel,
-) -> crate::transcription::transcript::TimestampLevel {
-    model.timestamps()
 }
 
 /// A whole clip as a non-macOS dictation run transcribes it: long pauses cut
@@ -1321,12 +1275,22 @@ impl Worker {
             Some(model) => model.gguf_selection(),
             None => self.parked.as_ref(),
         };
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
         let backend = self.model.as_ref().map(|model| model.backend().clone());
+        #[cfg(target_os = "windows")]
+        let backend = self.model.as_ref().and_then(Model::backend).cloned();
         #[cfg(target_os = "macos")]
         let backend = None;
         let mut held = self.held.lock().unwrap_or_else(|error| error.into_inner());
         held.selection = selection.cloned();
+        #[cfg(target_os = "windows")]
+        {
+            held.snapdragon = self
+                .model
+                .as_ref()
+                .and_then(Model::snapdragon_identity)
+                .cloned();
+        }
         held.backend = backend;
     }
 
@@ -1446,6 +1410,8 @@ impl Worker {
                 match result {
                     Ok(text) => job.finish(Ok(Transcribed {
                         text,
+                        #[cfg(target_os = "windows")]
+                        language: None,
                         source: Source::Stream,
                         finish_ms: started.elapsed().as_millis() as u64,
                     })),
@@ -1527,6 +1493,8 @@ impl Worker {
         })
         .map(|text| Transcribed {
             text: text.trim().to_string(),
+            #[cfg(target_os = "windows")]
+            language: model.detected_language().map(str::to_owned),
             source,
             finish_ms: started.elapsed().as_millis() as u64,
         });
@@ -1666,6 +1634,8 @@ mod tests {
         assert_eq!(fake.fed.len(), 8);
         job.finish(Ok(Transcribed {
             text: "streamed 8".into(),
+            #[cfg(target_os = "windows")]
+            language: None,
             source: Source::Stream,
             finish_ms: 0,
         }));
@@ -2643,6 +2613,8 @@ mod tests {
             job.start();
             job.finish(Ok(Transcribed {
                 text: "late but fine".into(),
+                #[cfg(target_os = "windows")]
+                language: None,
                 source: Source::Offline,
                 finish_ms: 0,
             }));
@@ -3002,7 +2974,7 @@ mod tests {
                 model: crate::transcription::models::TranscriptionModelId::ParakeetUnifiedEnglish,
                 language: "en".into(),
             }),
-            backend: None,
+            ..HeldSnapshot::default()
         };
         assert_eq!(
             engine.stream_refusal(),
@@ -3015,7 +2987,7 @@ mod tests {
                 model: crate::transcription::models::TranscriptionModelId::ParakeetV3,
                 language: "en".into(),
             }),
-            backend: None,
+            ..HeldSnapshot::default()
         };
         assert_eq!(
             engine.stream_refusal(),
@@ -3031,7 +3003,7 @@ mod tests {
                 ),
                 language: "en".into(),
             }),
-            backend: None,
+            ..HeldSnapshot::default()
         };
         assert_eq!(
             engine.stream_refusal(),

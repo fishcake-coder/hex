@@ -127,6 +127,10 @@ pub(crate) fn edge_bounds(len: usize, bounds: Range<usize>, margin: usize) -> Ra
 /// The detector's segments, or `None` when it is unavailable or failed.
 #[cfg(not(test))]
 fn heard(samples: &[f32]) -> Option<Vec<VadSegment>> {
+    #[cfg(target_os = "windows")]
+    if crate::transcription::snapdragon::configured() {
+        return None;
+    }
     let mut state = lock_state();
     let session = loaded_session(&mut state)?;
     match segments(session, samples) {

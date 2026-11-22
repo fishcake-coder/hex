@@ -262,7 +262,8 @@ pub(super) fn focused_application_known() -> bool {
 
 /// The current-user Run key is the source of truth, never `settings.json`.
 pub(super) fn launch_at_login() -> Option<Result<bool, String>> {
-    Some(crate::windows::login_item::is_enabled().map_err(|error| format!("{error:#}")))
+    crate::windows::login_item::available()
+        .then(|| crate::windows::login_item::is_enabled().map_err(|error| format!("{error:#}")))
 }
 
 pub(super) fn set_launch_at_login(enabled: bool) -> Result<bool, String> {

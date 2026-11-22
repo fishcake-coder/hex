@@ -142,8 +142,9 @@ explicit settings: no command turns Meetings on as a side effect.
 file here and decodes its first audio, so a file Hex can't read is refused
 before anything transcribes: WAV through hound (every sample read once up
 front, so a truncated WAV is refused), everything else through Symphonia, and
-Opus through opuscule (`transcription/pieces/media.rs`). It then
-sends the recording one piece at a time to `POST /transcriptions`
+Opus through opuscule (`transcription/pieces/media.rs`).
+With the [Snapdragon launcher](snapdragon-qnn.md), this command reads the same
+pieces and sends each to its own QNN worker. It otherwise sends the recording one piece at a time to `POST /transcriptions`
 (`Content-Type: audio/wav`), choosing the endpoint once
 (`control/cli/embedded.rs`): the running app's discovery file, so the app
 transcribes it with the model the request names, every piece on its dictation

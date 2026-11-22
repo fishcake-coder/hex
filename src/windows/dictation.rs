@@ -234,10 +234,18 @@ pub fn run(
 ) -> Result<()> {
     // Labs › Free memory when idle: a launch stays parked until the first
     // dictation, as after an idle unload.
-    let transcriber = if crate::labs::unload_idle().is_some() {
+    let snapdragon = crate::transcription::snapdragon::configured();
+    let transcriber = if snapdragon {
+        Some(
+            crate::transcription::snapdragon::Qnn::load(
+                &crate::transcription::snapdragon::language(),
+            )?
+            .into(),
+        )
+    } else if crate::labs::unload_idle().is_some() {
         None
     } else {
-        Some(LocalTranscriber::load(selection)?)
+        Some(LocalTranscriber::load(selection)?.into())
     };
     // The hook's shortcuts from the same settings, before its fields are
     // destructured below.
@@ -480,7 +488,9 @@ pub fn run(
                 };
                 emit_current_state(&mut events, recording, pending, &device_label)?;
             }
-            model.want(&next.transcription);
+            if !snapdragon {
+                model.want(&next.transcription);
+            }
         }
         // A GPU without room for two copies: the engine swaps in place.
         if !recording
@@ -500,7 +510,10 @@ pub fn run(
             && pending == 0
             && let Some(next) = model.take_ready()
         {
-            let old = std::mem::replace(&mut engine, Arc::new(TranscriptionEngine::start(next)?));
+            let old = std::mem::replace(
+                &mut engine,
+                Arc::new(TranscriptionEngine::start(next.into())?),
+            );
             engine.share();
             crate::capture_host::use_engine(&engine);
             // A request on the local API or a capture still transcribing

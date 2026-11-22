@@ -171,6 +171,31 @@ pub(super) fn basics(ui: &Ui, p: Paint, layer: &mut Vec<El>) -> Option<El> {
         None => (s::transcription_status(ui, p), picker_button),
     };
 
+    #[cfg(target_os = "windows")]
+    let (description, control) = if ui.live() && crate::transcription::snapdragon::configured() {
+        let active = ui
+            .view
+            .as_ref()
+            .and_then(|view| view.transcription.snapdragon.as_ref());
+        (
+            ui.view
+                .as_ref()
+                .and_then(|view| {
+                    view.transcription
+                        .error
+                        .clone()
+                        .or_else(|| view.listener.last_failure.clone())
+                })
+                .map(|error| (error, p.danger())),
+            fixed_value(
+                p,
+                "transcription-control",
+                active.map_or("Snapdragon QNN", |model| model.name()),
+            ),
+        )
+    } else {
+        (description, control)
+    };
     rows.push(
         icon_described_row(
             p,
@@ -215,6 +240,10 @@ pub(super) fn basics(ui: &Ui, p: Paint, layer: &mut Vec<El>) -> Option<El> {
 /// Hex can't listen yet. Fixtures that name no installed models say nothing,
 /// so their rows never depend on this machine's models.
 pub(super) fn missing_model(ui: &Ui) -> Option<crate::desktop::onboarding::ModelProgress> {
+    #[cfg(target_os = "windows")]
+    if ui.live() && crate::transcription::snapdragon::configured() {
+        return None;
+    }
     if !ui.live() && ui.picker.installed.is_none() {
         return None;
     }
@@ -320,6 +349,28 @@ fn pause_browser_rows(ui: &Ui, p: Paint) -> Vec<El> {
 /// The model's languages as a quiet select, or the fallback note when
 /// switching to a single-language model changed the saved language.
 fn language_row(ui: &Ui, p: Paint, layer: &mut Vec<El>) -> Option<El> {
+    #[cfg(target_os = "windows")]
+    if ui.live() && crate::transcription::snapdragon::configured() {
+        let language = ui
+            .view
+            .as_ref()
+            .and_then(|view| view.transcription.snapdragon.as_ref())
+            .map_or_else(crate::transcription::snapdragon::language, |model| {
+                model.language.clone()
+            });
+        return Some(icon_row(
+            p,
+            "transcription-language",
+            &LANGUAGES,
+            tr("Language"),
+            Some(tr("Set by the Snapdragon launcher")),
+            fixed_value(
+                p,
+                "transcription-language-control",
+                transcription_models::language_name(&language),
+            ),
+        ));
+    }
     let selection = &ui.settings.transcription;
     let model = transcription_models::definition(selection.model);
     let current = transcription_models::language_name(&selection.language);
@@ -1130,6 +1181,23 @@ pub(super) fn disclosure_toggle(ui: &Ui, p: Paint, pane: Pane, label: &str) -> E
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn speech_engine_row(ui: &Ui, p: Paint, layer: &mut Vec<El>) -> CardRow {
     use crate::app_settings::TranscriptionDevice;
+    #[cfg(target_os = "windows")]
+    if ui.live() && crate::transcription::snapdragon::configured() {
+        let engine = ui
+            .view
+            .as_ref()
+            .and_then(|view| view.transcription.backend.as_ref())
+            .map_or("Snapdragon QNN", |backend| backend.device.as_str());
+        return icon_row(
+            p,
+            "speech-engine",
+            &WAVE,
+            tr("Speech engine"),
+            None,
+            fixed_value(p, "speech-engine-control", engine),
+        )
+        .into();
+    }
     let device = ui.settings.transcription_device;
     let control = pick_select(
         ui,
@@ -1222,6 +1290,16 @@ fn speech_engine_row(ui: &Ui, p: Paint, layer: &mut Vec<El>) -> CardRow {
         control,
     )
     .into()
+}
+
+#[cfg(target_os = "windows")]
+fn fixed_value(p: Paint, key: &'static str, value: &str) -> El {
+    row().key(key).h(24.0).center_y().child(
+        text(value.to_owned())
+            .key("value")
+            .font(value_font(p))
+            .color(p.faint()),
+    )
 }
 
 /// An icon row choosing one of `labels` from a quiet select.

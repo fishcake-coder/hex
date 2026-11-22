@@ -1,15 +1,29 @@
 use std::io::ErrorKind;
 use std::path::Path;
 
-use color_eyre::eyre::{Result, WrapErr};
+use color_eyre::eyre::{Result, WrapErr, ensure};
 use winreg::RegKey;
 use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const VALUE_NAME: &str = "Hex";
 
+/// The isolated Snapdragon launcher provides its own profile and worker environment.
+pub(crate) fn available() -> bool {
+    !crate::transcription::snapdragon::configured()
+}
+
+fn require_available() -> Result<()> {
+    ensure!(
+        available(),
+        "Launch at login is unavailable in the Snapdragon launcher"
+    );
+    Ok(())
+}
+
 /// Return the Windows-owned startup registration state.
 pub fn is_enabled() -> Result<bool> {
+    require_available()?;
     let current_user = RegKey::predef(HKEY_CURRENT_USER);
     let key = match current_user.open_subkey_with_flags(RUN_KEY, KEY_READ) {
         Ok(key) => key,
@@ -25,6 +39,7 @@ pub fn is_enabled() -> Result<bool> {
 
 /// Register or unregister the current executable for the current Windows user.
 pub fn set_enabled(enabled: bool) -> Result<()> {
+    require_available()?;
     if enabled {
         let executable = std::env::current_exe().wrap_err("could not locate the Hex executable")?;
         write_startup_command(&executable, "could not register Hex to launch at login")?;
@@ -50,7 +65,7 @@ pub fn set_enabled(enabled: bool) -> Result<()> {
 /// after a self-update activates a new version directory. Does nothing
 /// when launch at login is disabled.
 pub fn repoint(executable: &Path) -> Result<()> {
-    if !is_enabled()? {
+    if !available() || !is_enabled()? {
         return Ok(());
     }
     write_startup_command(executable, "could not repoint the Hex startup registration")
@@ -66,6 +81,9 @@ pub fn repoint(executable: &Path) -> Result<()> {
 /// `versions` folder, and a copy that isn't the current version stay as they
 /// are.
 pub fn follow_current_version() -> Result<()> {
+    if !available() {
+        return Ok(());
+    }
     let current_user = RegKey::predef(HKEY_CURRENT_USER);
     let key = match current_user.open_subkey_with_flags(RUN_KEY, KEY_READ) {
         Ok(key) => key,

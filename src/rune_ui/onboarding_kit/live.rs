@@ -456,6 +456,10 @@ pub(in crate::rune_ui) fn fixture_resume(ui: &mut Ui, page: Page) {
 /// finished and opens it now. Settings, history, models, and permissions
 /// stay as they are, so the run finds them ready and passes their steps.
 pub(crate) fn restart(ui: &mut Ui, tx: &mut Tx) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    if ui.live() && crate::transcription::snapdragon::configured() {
+        return Err("Snapdragon QNN is set up through the launcher".into());
+    }
     if ui.live() {
         crate::desktop::onboarding::reset().map_err(|error| format!("{error:#}"))?;
     }

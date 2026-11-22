@@ -140,6 +140,8 @@ impl Capabilities {
             Self::LINUX
         };
         Self {
+            #[cfg(target_os = "windows")]
+            launch_at_login: crate::windows::login_item::available(),
             terminal_paste: super::host::TERMINAL_PASTE,
             keyboard_model_switching: os.keyboard_model_switching
                 && crate::keyboard_input_sources::available(),

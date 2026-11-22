@@ -31,6 +31,9 @@ pub(super) fn process_dictation_job(
             audio_ms = job.audio_ms,
             "transcribed Windows dictation"
         );
+        if let Some(language) = transcribed.language {
+            job.language = language;
+        }
         transcribed.text
     });
     let inference_ms = inference_started.elapsed().as_millis() as u64;

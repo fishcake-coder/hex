@@ -880,9 +880,14 @@ fn engine_model(model: &mut crate::transcription::engine::Model) -> Option<&mut 
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn engine_model(model: &mut crate::transcription::engine::Model) -> Option<&mut Transcriber> {
     Some(model)
+}
+
+#[cfg(target_os = "windows")]
+fn engine_model(model: &mut crate::transcription::engine::Model) -> Option<&mut Transcriber> {
+    model.gguf()
 }
 
 /// What the rolling worker transcribes chunks with: [`ChunkModel`], or a

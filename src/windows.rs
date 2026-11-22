@@ -342,7 +342,7 @@ fn stream_bench(wav: &Path, speed: f64, selection: &TranscriptionSelection) -> R
     let offline = transcriber.transcribe(&samples)?;
     let offline_ms = started.elapsed().as_millis();
 
-    let engine = crate::transcription::engine::TranscriptionEngine::start(transcriber)?;
+    let engine = crate::transcription::engine::TranscriptionEngine::start(transcriber.into())?;
     let mut stream = engine
         .begin_ignoring_head(0)
         .ok_or_else(|| color_eyre::eyre::eyre!("this model cannot stream on this device"))?;

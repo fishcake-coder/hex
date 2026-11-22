@@ -430,6 +430,7 @@ fn backend_name(kind: &str) -> String {
         "cuda" => "CUDA".into(),
         "gpu" => "GPU".into(),
         "metal" => "Metal".into(),
+        "qnn" => "QNN".into(),
         "rocm" => "ROCm".into(),
         "vulkan" => "Vulkan".into(),
         other => {

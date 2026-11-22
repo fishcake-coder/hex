@@ -1099,6 +1099,8 @@ pub(super) fn fixture(shortcuts: DesktopShortcuts) -> Ui {
             selection: ui.settings.transcription.clone(),
             preparing: None,
             backend: None,
+            #[cfg(target_os = "windows")]
+            snapdragon: None,
         },
         update_status: DesktopUpdateStatus::Current,
         update_notes: None,

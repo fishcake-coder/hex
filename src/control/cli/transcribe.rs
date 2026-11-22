@@ -1,7 +1,8 @@
 //! `hex transcribe <file>`: a saved recording through the running Hex's
 //! local API, or with no Hex running through an embedded service this
 //! command starts and stops ([`super::embedded`]). Nothing is pasted, saved
-//! to History, or processed, and this process never loads a model.
+//! to History, or processed. The opt-in Windows Snapdragon worker is owned
+//! directly by this command; other models use the service.
 //!
 //! A file of any length is read in pieces of at most 30 s
 //! ([`crate::transcription::pieces`]) and their text is joined with one space:
@@ -52,6 +53,11 @@ fn transcribe(
     language: Option<String>,
     json: bool,
 ) -> ControlReply {
+    #[cfg(target_os = "windows")]
+    if crate::transcription::snapdragon::configured() {
+        return transcribe_snapdragon(file, model.as_deref(), language.as_deref());
+    }
+
     let settings = match crate::app_settings::AppSettings::read() {
         Ok(settings) => settings,
         Err(error) => {
@@ -82,11 +88,47 @@ fn prepare_job(
     model: Option<String>,
     language: Option<String>,
 ) -> std::result::Result<(Pieces, TranscriptionSelection), ControlReply> {
-    let mut pieces = Pieces::open(file).map_err(|error| refused(file, error))?;
-    pieces.validate().map_err(|error| refused(file, error))?;
+    let pieces = open(file)?;
     let model = model.unwrap_or_else(|| settings.transcription.model.as_str().to_owned());
     let selection = model_selection(settings, &model, language.as_deref())?;
     Ok((pieces, selection))
+}
+
+fn open(file: &Path) -> std::result::Result<Pieces, ControlReply> {
+    let mut pieces = Pieces::open(file).map_err(|error| refused(file, error))?;
+    pieces.validate().map_err(|error| refused(file, error))?;
+    Ok(pieces)
+}
+
+#[cfg(target_os = "windows")]
+fn transcribe_snapdragon(file: &Path, model: Option<&str>, language: Option<&str>) -> ControlReply {
+    use crate::transcription::snapdragon;
+    let mut pieces = match open(file) {
+        Ok(pieces) => pieces,
+        Err(reply) => return reply,
+    };
+    let mut worker =
+        match snapdragon::Qnn::load(&language.map_or_else(snapdragon::language, str::to_owned)) {
+            Ok(worker) => worker,
+            Err(error) => return ControlReply::error("model-unavailable", format!("{error:#}")),
+        };
+    if let Some(model) = model
+        && model != worker.identity().model
+    {
+        return ControlReply::error(
+            "unsupported-model",
+            format!(
+                "Snapdragon QNN is configured for {}; clear HEX_SNAPDRAGON_WORKER to select another model",
+                worker.identity().model
+            ),
+        );
+    }
+    read_pieces(file, &mut pieces, |samples, _| {
+        worker
+            .transcribe(&samples)
+            .map(|transcript| transcript.text)
+            .map_err(|error| ControlReply::error("failed", format!("{error:#}")))
+    })
 }
 
 /// The refusal for a file Hex cannot read, before any transcription runs, or
@@ -163,32 +205,15 @@ fn run_pieces(
         .append_pair("language", &selection.language)
         .finish();
     let path = format!("/transcriptions?{query}");
-    let name = file.file_name().map_or_else(
-        || file.display().to_string(),
-        |name| name.to_string_lossy().into_owned(),
-    );
     let model = selection.model.as_str();
-    let mut texts = Vec::new();
-    let mut length = 0;
     let mut prepared = false;
-    loop {
-        show_progress(&name, pieces);
-        let samples = match pieces.next() {
-            Ok(Some(samples)) => samples,
-            Ok(None) => break,
-            Err(error) => return refused(file, error),
-        };
-        let wav = match crate::transcription::pieces::wav_bytes(&samples) {
-            Ok(wav) => wav,
-            Err(error) => return refused(file, error),
-        };
+    read_pieces(file, pieces, |samples, refresh_progress| {
+        let wav = crate::transcription::pieces::wav_bytes(&samples)
+            .map_err(|error| refused(file, error))?;
         drop(samples);
-        let text = loop {
+        loop {
             match endpoint.post(&path, "audio/wav", &wav, TIMEOUT, MAX_RESPONSE) {
-                Ok((200, body)) => match transcript(&body) {
-                    Ok(text) => break text,
-                    Err(reply) => return reply,
-                },
+                Ok((200, body)) => return transcript(&body),
                 Ok((status, body)) => {
                     let code = crate::local_api::error_code(status, &body);
                     if code == "model-not-ready"
@@ -197,16 +222,39 @@ fn run_pieces(
                         && prepare::consent(selection, json)
                     {
                         prepared = true;
-                        if let Err(reply) = prepare::prepare(endpoint, selection) {
-                            return reply;
-                        }
-                        show_progress(&name, pieces);
+                        prepare::prepare(endpoint, selection)?;
+                        refresh_progress();
                         continue;
                     }
-                    return refusal(status, &code, model);
+                    return Err(refusal(status, &code, model));
                 }
-                Err(error) => return ControlReply::error("transport", format!("{error:#}")),
+                Err(error) => return Err(ControlReply::error("transport", format!("{error:#}"))),
             }
+        }
+    })
+}
+
+fn read_pieces(
+    file: &Path,
+    pieces: &mut Pieces,
+    mut transcribe: impl FnMut(Vec<f32>, &dyn Fn()) -> std::result::Result<String, ControlReply>,
+) -> ControlReply {
+    let name = file.file_name().map_or_else(
+        || file.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let mut texts = Vec::new();
+    let mut length = 0;
+    loop {
+        show_progress(&name, pieces);
+        let samples = match pieces.next() {
+            Ok(Some(samples)) => samples,
+            Ok(None) => break,
+            Err(error) => return refused(file, error),
+        };
+        let text = match transcribe(samples, &|| show_progress(&name, pieces)) {
+            Ok(text) => text,
+            Err(reply) => return reply,
         };
         // A piece that heard no speech adds nothing: only a file with
         // nothing to say answers no-speech.

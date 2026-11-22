@@ -72,6 +72,7 @@ in English and 24-hour ("14:30") in every other interface language.
 The [vocabulary](vocabulary.md) biases transcription toward names you list; its
 Labs › Vocabulary files toggle (off by default, every OS) imports terms from a
 CSV file into the Vocabulary sheet and exports the list as one.
+[Snapdragon QNN dictation](snapdragon-qnn.md) covers the Windows ARM64 opt-in launcher, model identity, language, and file transcription.
 [Your own speech models](own-models.md) covers adding a GGUF file and using
 models another app already downloaded; its Labs › Smaller model files toggle
 (off by default, macOS) also accepts imports quantized to Q6_K, Q5_K, or Q4_K.
