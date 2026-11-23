@@ -28,6 +28,10 @@ if "%~1"=="" goto desktop
 exit /b %errorlevel%
 
 :desktop
+if exist "%hexBin%\Hex Snapdragon NPU.exe" (
+    start "" "%hexBin%\Hex Snapdragon NPU.exe"
+    exit /b
+)
 start "Hex Snapdragon" "%hexBin%\hex.exe"
 exit /b %errorlevel%
 

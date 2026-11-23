@@ -7,8 +7,9 @@ QNN ONNX model with 8-bit weights and 16-bit activations (`w8a16`). See the
 The launcher opts in for the process it starts.
 
 ```ts
-Hex Snapdragon.cmd                           // dictation.snapdragon-qnn
-├── Launch -> starts the Windows listener after the QNN HTP handshake
+Hex Snapdragon NPU                           // dictation.snapdragon-qnn
+├── Open from Start -> shows Hex and starts the listener after the QNN HTP handshake
+├── Open again -> restores the window for the running listener
 ├── Hold and release -> transcribes a finished clip, then processes and pastes as usual
 ├── hex dictation stop --print -> uses the same listener and prints the result
 ├── hex status --json -> names the verified model, language setting, and QNN HTP device
@@ -16,15 +17,15 @@ Hex Snapdragon.cmd                           // dictation.snapdragon-qnn
     └── Sends the decoded pieces in order to this command's own QNN worker
 ```
 
-Run [the Windows ARM64 build script](../../scripts/build-snapdragon.ps1) and
-[the QNN setup script](../../scripts/snapdragon/setup.ps1) first. Then
-double-click [Hex Snapdragon.cmd](<../../Hex Snapdragon.cmd>) to open Hex.
-In PowerShell, you can run the launcher with CLI arguments, for example
+Run [the Windows ARM64 build script](../../scripts/build-snapdragon.ps1),
+[the QNN setup script](../../scripts/snapdragon/setup.ps1), and
+[the Start menu launcher installer](../../scripts/snapdragon/install-launcher.ps1).
+Open **Hex Snapdragon NPU** from the Windows Start menu.
+In PowerShell, use [Hex Snapdragon.cmd](<../../Hex Snapdragon.cmd>) for CLI commands, for example
 `& '.\Hex Snapdragon.cmd' transcribe .\recording.wav --language he`.
 Use the same launcher for `status` and dictation control commands so they
 address its isolated profile.
-Launch at login is unavailable in the Snapdragon session. The Start Menu
-shortcut can point to the launcher to open it with the QNN environment.
+Launch at login is unavailable in the Snapdragon session.
 
 The launcher provides the absolute worker path in `HEX_SNAPDRAGON_WORKER`.
 `HEX_SNAPDRAGON_PYTHON` and `HEX_SNAPDRAGON_MODEL_DIR` override the Python
