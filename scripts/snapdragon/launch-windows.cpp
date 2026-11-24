@@ -33,10 +33,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     const fs::path bin = fs::path(executable).parent_path();
     const fs::path app = bin / L"hex.exe";
     const fs::path runtime = fs::path(local) / L"Hex" / L"snapdragon";
+    const bool custom_worker = GetEnvironmentVariableW(L"HEX_SNAPDRAGON_WORKER", nullptr, 0) != 0;
     if (!set_default(L"HEX_APPLICATION_SUPPORT_DIR", bin.parent_path() / L"profile") ||
-        !set_default(L"HEX_SNAPDRAGON_WORKER", bin / L"whisper_qnn.py") ||
+        !set_default(L"HEX_SNAPDRAGON_WORKER", bin / L"select_model.py") ||
         !set_default(L"HEX_SNAPDRAGON_PYTHON", runtime / L"venv" / L"Scripts" / L"python.exe") ||
-        !set_default(L"HEX_SNAPDRAGON_MODEL_DIR", runtime / L"models")) {
+        (custom_worker && !set_default(L"HEX_SNAPDRAGON_MODEL_DIR", runtime / L"models"))) {
         return show_error(L"Windows could not configure the Hex Snapdragon environment.");
     }
 

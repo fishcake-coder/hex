@@ -26,9 +26,11 @@ if ($env:VSCMD_ARG_TGT_ARCH -ne 'arm64') {
 
 $source = Join-Path $PSScriptRoot 'launch-windows.cpp'
 $object = Join-Path $root 'snapdragon-launcher.obj'
+foreach ($worker in 'select_model.py', 'whisper_qnn.py', 'parakeet_tdt.py', 'unified_rnnt.py') {
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot $worker) -Destination $bin
+}
 & cl.exe /nologo /std:c++17 /EHsc /O2 /MT /W4 /WX $source "/Fo:$object" "/Fe:$launcher" user32.lib /link /subsystem:windows
 if ($LASTEXITCODE -ne 0) { throw "Could not build the ARM64 launcher (exit $LASTEXITCODE)." }
-Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'whisper_qnn.py') -Destination $bin
 
 $programs = [Environment]::GetFolderPath('Programs')
 $shortcut = Join-Path $programs 'Hex Snapdragon NPU.lnk'

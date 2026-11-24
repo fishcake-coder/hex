@@ -1,10 +1,8 @@
 # Snapdragon QNN dictation
 
-This local Windows ARM64 build runs Whisper Large v3 Turbo on the Hexagon NPU.
-Setup pins Qualcomm AI Hub's `v0.66.0` Snapdragon X Elite export, a precompiled
-QNN ONNX model with 8-bit weights and 16-bit activations (`w8a16`). See the
-[Qualcomm AI Hub model page](https://aihub.qualcomm.com/compute/models/whisper_large_v3_turbo_quantized).
-The launcher opts in for the process it starts.
+This local Windows ARM64 build runs Whisper and Parakeet models through the
+Qualcomm QNN execution provider on the Hexagon NPU. The launcher opts in for
+the process it starts. A fresh installation starts with Whisper Large v3 Turbo.
 
 ```ts
 Hex Snapdragon NPU                           // dictation.snapdragon-qnn
@@ -13,6 +11,7 @@ Hex Snapdragon NPU                           // dictation.snapdragon-qnn
 ├── Hold and release -> transcribes a finished clip, then processes and pastes as usual
 ├── hex dictation stop --print -> uses the same listener and prints the result
 ├── hex status --json -> names the verified model, language setting, and QNN HTP device
+├── snapdragon-model use <profile> -> verifies the installed QNN model and saves it for the next launch
 └── transcribe <file> [--language <code>]   // cli.transcribe-snapdragon-qnn
     └── Sends the decoded pieces in order to this command's own QNN worker
 ```
@@ -21,45 +20,101 @@ Run [the Windows ARM64 build script](../../scripts/build-snapdragon.ps1),
 [the QNN setup script](../../scripts/snapdragon/setup.ps1), and
 [the Start menu launcher installer](../../scripts/snapdragon/install-launcher.ps1).
 Open **Hex Snapdragon NPU** from the Windows Start menu.
-In PowerShell, use [Hex Snapdragon.cmd](<../../Hex Snapdragon.cmd>) for CLI commands, for example
-`& '.\Hex Snapdragon.cmd' transcribe .\recording.wav --language he`.
+In PowerShell, use [Hex Snapdragon.cmd](<../../Hex Snapdragon.cmd>) for CLI commands.
+With a Whisper profile selected, `& '.\Hex Snapdragon.cmd' transcribe .\recording.wav --language he`
+transcribes a Hebrew recording.
 Use the same launcher for `status` and dictation control commands so they
 address its isolated profile.
 Launch at login is unavailable in the Snapdragon session.
 
-The launcher provides the absolute worker path in `HEX_SNAPDRAGON_WORKER`.
-`HEX_SNAPDRAGON_PYTHON` and `HEX_SNAPDRAGON_MODEL_DIR` override the Python
-environment and model directory under `%LOCALAPPDATA%\Hex\snapdragon`.
-`HEX_SNAPDRAGON_LANGUAGE` sets a language code for desktop dictation.
-It defaults to `auto`. `hex transcribe --language` overrides it for that file.
-General displays the active model and the launcher-selected language.
-The configured app skips the GGUF download step and keeps the worker warm
-while listening. The usual Windows model picker and automatic model switches
-are unavailable in this session. Clear `HEX_SNAPDRAGON_WORKER` and restart
-to select a catalog model.
+## Models and switching
+
+- `whisper` uses Qualcomm's precompiled 8-bit weights and 16-bit activations.
+  Both model graphs run on the NPU. It supports automatic detection and explicit
+  languages, including Hebrew. Install with [the Whisper setup script](../../scripts/snapdragon/setup.ps1).
+  [Qualcomm model card](https://aihub.qualcomm.com/compute/models/whisper_large_v3_turbo_quantized)
+- `whisper-float` uses Qualcomm's FP16 export with the same language controls.
+  Both graphs run on the NPU. Pass `-Precision float` to the Whisper setup script
+  to install the roughly 2.2 GB model in `models-float`.
+  [Qualcomm export](https://huggingface.co/qualcomm/Whisper-Large-V3-Turbo)
+- `parakeet-tdt` uses an NPU encoder and a CPU TDT decoder. It automatically
+  recognizes 25 European languages, including English. Install with
+  [the TDT setup script](../../scripts/snapdragon/setup-parakeet-tdt.ps1).
+  [NVIDIA model](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3),
+  [OpenWritr NPU export](https://huggingface.co/trsdn/parakeet-tdt-0.6b-v3-htp-int8-8s),
+  [ONNX decoder export](https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx)
+- `parakeet-unified-qnn` uses Parakeet Unified English 0.6B with a
+  length-masked NPU encoder and an NPU decoder. The setup builds 12 encoder
+  stages with a 12.8-second audio window by default. Install and compile the
+  QNN contexts with [the Unified setup script](../../scripts/snapdragon/setup-parakeet-unified.ps1).
+  [NVIDIA model](https://huggingface.co/nvidia/parakeet-unified-en-0.6b),
+  [ONNX export](https://huggingface.co/bobNight/parakeet-unified-en-0.6b-onnx)
+
+Quit Hex, choose an installed model, then reopen **Hex Snapdragon NPU** from
+Start. The selection is shared with the file command.
+
+```powershell
+& '.\Hex Snapdragon.cmd' snapdragon-model list
+& '.\Hex Snapdragon.cmd' snapdragon-model use parakeet-unified-qnn
+& '.\Hex Snapdragon.cmd' snapdragon-model status
+```
+
+Use `snapdragon-model use whisper` to switch back. `snapdragon-model status`
+reports the selection for the next process. `status --json` reports the live listener.
+Set `HEX_SNAPDRAGON_PROFILE` in the calling environment for a temporary
+selection. Advanced overrides use `HEX_SNAPDRAGON_WORKER`,
+`HEX_SNAPDRAGON_PYTHON`, and `HEX_SNAPDRAGON_MODEL_DIR`. Models and the
+shared Python environment live under `%LOCALAPPDATA%\Hex\snapdragon`.
+
+`HEX_SNAPDRAGON_LANGUAGE` defaults to `auto` for desktop dictation.
+`hex transcribe --language` sets the language for one file with a compatible
+model. General displays the active model and language setting.
+
+The configured app keeps the worker warm while listening. Start standard Hex
+to use its catalog and automatic model switching.
 
 The listener and file command send short-lived mono 16 kHz WAVs over a
 private local handoff. Hex removes each WAV when the request finishes.
 An abrupt process kill can leave a `hex-snapdragon-*.wav` in the user's
-temporary directory. Long clips cut near a quiet point to fit the 30-second
-Whisper window. The configured process skips Hex's optional Silero detector.
+temporary directory. Long clips cut near a quiet point to fit the model window.
+The configured process skips Hex's optional Silero detector.
 The ordinary low-level silence and short-tap checks still apply to dictation.
 QNN works on finished audio, so streaming live text is unavailable.
 
-The Whisper encoder and decoder graphs run on the NPU through the QNN
-execution provider. The CPU handles WAV loading, audio windowing, log-Mel
-features, input quantization, and selection and decoding of text and
-timestamp tokens. The worker disables CPU fallback for both model graphs.
+The CPU handles loading, windowing, audio features, and token selection.
+Every graph assigned to QNN has CPU fallback disabled.
 
 A missing model, worker startup failure, or failed transcription reports
-an error. Hex does not switch to CPU speech inference or download a substitute
-model. Separate local API requests that explicitly select a catalog model
+an error. Separate local API requests that explicitly select a catalog model
 still use that catalog model. The standalone file command opens its own worker
 and can consume NPU memory alongside the listener.
 
 ## Local verification
 
-On one Snapdragon X Plus X1P42100, QNN recorded accelerator execution time
+On a Snapdragon X Plus X1P42100, Parakeet Unified English recorded QNN
+accelerator execution for all 12 encoder stages and its RNNT predictor/joint
+graph. QNN CPU fallback was disabled. The CPU computed the audio features,
+selected tokens, and assembled the text. The precompiled Unified install was
+1.26 GB. An unprofiled warm worker returned a 1.26-second English clip in 91 ms.
+
+The following comparison used 108 disjoint English clips, 36 each from AMI
+meetings, Earnings22 calls and LibriSpeech test-other. The clips contained
+717.09 seconds of audio and 1,916 normalized reference words. WER counts
+substitutions, deletions and insertions after English normalization with
+whisper-normalizer 0.1.12. Times cover the warm worker requests and exclude
+model loading, microphone capture and pasting.
+
+| Model on this laptop | Word errors | WER | Transcription time |
+| --- | ---: | ---: | ---: |
+| Parakeet Unified English (NPU encoder and decoder) | 184 | 9.60% | 18.74 s |
+| Parakeet TDT v3 (NPU encoder, CPU decoder) | 205 | 10.70% | 17.47 s |
+| Whisper Large v3 Turbo w8a16 (NPU encoder and decoder) | 211 | 11.01% | 50.47 s |
+
+The 72-clip holdout was separate from the 36 clips used during development.
+Unified led on meetings, TDT on earnings calls and Whisper on audiobooks.
+
+
+For quantized Whisper on one Snapdragon X Plus X1P42100, QNN recorded accelerator execution time
 for six encoder runs and 240 decoder steps during the fixture checks. The
 ARM64 worker matched a 2.24-second English fixture with automatic language
 detection and a 4.7-second Hebrew fixture in both automatic and explicit
@@ -72,7 +127,9 @@ of clips in two languages on one device.
 With profiling off and the worker already warm, three repeats of the same
 2.24-second English fixture took 0.40–0.42 seconds each from the WAV request
 to the transcription reply. The median was 0.41 seconds. This measurement
-excludes app startup, microphone capture, and pasting.
+excludes app startup, microphone capture, and pasting. On the same system,
+the Parakeet TDT v3 encoder recorded six HTP runs. Four warm repetitions of
+the English fixture took about 0.10 seconds per WAV request.
 
 Implementation lives in [the QNN adapter](../../src/transcription/snapdragon.rs),
 [the Windows listener](../../src/windows/dictation.rs), and

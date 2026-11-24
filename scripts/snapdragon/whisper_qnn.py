@@ -16,6 +16,10 @@ FFT_SAMPLES = 400
 TIMESTAMP_MS = 20
 PROVIDER = "QNNExecutionProvider"
 MODEL = "whisper-large-v3-turbo"
+EXPORT_VARIANTS = {
+    ("whisper_large_v3_turbo_quantized", "w8a16"),
+    ("whisper_large_v3_turbo", "float"),
+}
 
 
 def read_json(path):
@@ -38,16 +42,21 @@ def create_session(path, device, backend, profile_dir):
     return session
 
 
-def quantize(value, spec):
-    params = spec["quantization_parameters"]
+def encode_tensor(value, spec):
+    params = spec.get("quantization_parameters")
+    if params is None:
+        return value.astype(spec["dtype"], copy=False)
     limits = np.iinfo(spec["dtype"])
     raw = np.rint(value / params["scale"]) + params["zero_point"]
     return np.clip(raw, limits.min, limits.max).astype(spec["dtype"])
 
 
-def dequantize(value, spec):
-    params = spec["quantization_parameters"]
-    return (value.astype(np.float32) - params["zero_point"]) * params["scale"]
+def decode_logits(value, spec):
+    logits = value.astype(np.float32)
+    params = spec.get("quantization_parameters")
+    if params is None:
+        return logits
+    return (logits - params["zero_point"]) * params["scale"]
 
 
 def log_sum_exp(values):
@@ -57,14 +66,14 @@ def log_sum_exp(values):
     return maximum + np.log(np.exp(values - maximum).sum())
 
 
-def quantized_zero(spec):
-    return np.full(spec["shape"], spec["quantization_parameters"]["zero_point"], spec["dtype"])
+def tensor_zero(spec):
+    return spec.get("quantization_parameters", {}).get("zero_point", 0)
 
 
 def match_cache_specs(outputs, inputs, pairs):
     for output, input_name in pairs:
         if outputs[output] != inputs[input_name]:
-            raise RuntimeError(f"Mismatched quantization for Whisper attention cache {output}")
+            raise RuntimeError(f"Mismatched tensor specifications for Whisper attention cache {output}")
 
 
 def validate_tensor_specs(session, graph):
@@ -126,11 +135,10 @@ class Whisper:
 
         metadata = read_json(model_dir / "metadata.json")
         if (
-            metadata["model_id"] != "whisper_large_v3_turbo_quantized"
-            or metadata["runtime"] != "precompiled_qnn_onnx"
-            or metadata["precision"] != "w8a16"
+            metadata["runtime"] != "precompiled_qnn_onnx"
+            or (metadata["model_id"], metadata["precision"]) not in EXPORT_VARIANTS
         ):
-            raise RuntimeError("Expected the Qualcomm w8a16 Whisper large-v3-turbo QNN export")
+            raise RuntimeError("Expected a Qualcomm w8a16 or float Whisper large-v3-turbo QNN export")
         graphs = metadata["model_files"]
         self.encoder_input = graphs["encoder.onnx"]["inputs"]["input_features"]
         self.cross_names = list(graphs["encoder.onnx"]["outputs"])
@@ -138,7 +146,10 @@ class Whisper:
         self.decoder_outputs = graphs["decoder.onnx"]["outputs"]
         self.self_names = [name for name in self.decoder_inputs if name.endswith("_in")]
         self.self_outputs = [name.removesuffix("_in") + "_out" for name in self.self_names]
-        self.cache_zeros = {name: quantized_zero(self.decoder_inputs[name]) for name in self.self_names}
+        self.cache_zeros = {}
+        for name in self.self_names:
+            spec = self.decoder_inputs[name]
+            self.cache_zeros[name] = np.full(spec["shape"], tensor_zero(spec), spec["dtype"])
         match_cache_specs(self.decoder_outputs, self.decoder_inputs, zip(self.self_outputs, self.self_names))
         match_cache_specs(graphs["encoder.onnx"]["outputs"], self.decoder_inputs, zip(self.cross_names, self.cross_names))
 
@@ -182,6 +193,7 @@ class Whisper:
             "onnx_runtime": ort.__version__,
             "qnn_ep": version("onnxruntime-qnn"),
             "qairt_export": metadata["tool_versions"]["qairt"],
+            "precision": metadata["precision"],
             "cpu_fallback": False,
         }
 
@@ -217,11 +229,12 @@ class Whisper:
         return int(np.argmax(logits))
 
     def decode(self, audio, language):
-        features = quantize(log_mel(audio, self.hann, self.mel_filters), self.encoder_input)
+        features = encode_tensor(log_mel(audio, self.hann, self.mel_filters), self.encoder_input)
         cross = self.encoder.run(self.cross_names, {"input_features": features})
         mask_spec = self.decoder_inputs["attention_mask"]
         mask = np.full(mask_spec["shape"], -100.0, dtype=np.float32)
-        mask = quantize(mask, mask_spec)
+        mask = encode_tensor(mask, mask_spec)
+        mask_zero = tensor_zero(mask_spec)
         inputs = dict(zip(self.cross_names, cross, strict=True)) | self.cache_zeros
         inputs["input_ids"] = np.empty((1, 1), dtype=np.int32)
         inputs["position_ids"] = np.empty((1,), dtype=np.int32)
@@ -232,10 +245,10 @@ class Whisper:
         def step(token, position):
             inputs["input_ids"].fill(token)
             inputs["position_ids"].fill(position)
-            mask[..., -1 - position] = mask_spec["quantization_parameters"]["zero_point"]
+            mask[..., -1 - position] = mask_zero
             logits, *cache = self.decoder.run(output_names, inputs)
             inputs.update(zip(self.self_names, cache, strict=True))
-            return dequantize(logits.reshape(-1), logits_spec)
+            return decode_logits(logits.reshape(-1), logits_spec)
 
         logits = step(self.start_token, 0)
         if language is None:

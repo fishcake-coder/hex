@@ -1,7 +1,9 @@
 [CmdletBinding()]
 param(
     [string]$Archive,
-    [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'Hex\snapdragon')
+    [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'Hex\snapdragon'),
+    [ValidateSet('w8a16', 'float')]
+    [string]$Precision = 'w8a16'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -29,13 +31,22 @@ if ($cpu.Architecture -ne 12) {
 Get-Command uv -ErrorAction Stop | Out-Null
 
 $root = (New-Item -Path $InstallDir -ItemType Directory -Force).FullName
-$modelDir = Join-Path $root 'models'
+$modelFolder = 'models'
+$modelId = 'whisper_large_v3_turbo_quantized'
+$archiveHash = 'C437E3265BF195C2527A8DF331B4643C1C589B500DD4AFE08ABAEF2FADB4FBAC'
+$archiveSize = 823697025
+if ($Precision -eq 'float') {
+    $modelFolder = 'models-float'
+    $modelId = 'whisper_large_v3_turbo'
+    $archiveHash = '89E0C9F4FC8F2A141F5BA734E9C063F6EE1A04E6DAF44C4C0F2F82D56B01B8FC'
+    $archiveSize = 2018038680
+}
+$modelDir = Join-Path $root $modelFolder
 $venv = Join-Path $root 'venv'
 $python = Join-Path $venv 'Scripts\python.exe'
 $release = 'v0.66.0'
-$asset = 'whisper_large_v3_turbo_quantized-precompiled_qnn_onnx-w8a16-qualcomm_snapdragon_x_elite'
-$base = 'https://qaihub-public-assets.s3.us-west-2.amazonaws.com/qai-hub-models/models/whisper_large_v3_turbo_quantized/releases'
-$archiveHash = 'C437E3265BF195C2527A8DF331B4643C1C589B500DD4AFE08ABAEF2FADB4FBAC'
+$asset = "$modelId-precompiled_qnn_onnx-$($Precision.ToLowerInvariant())-qualcomm_snapdragon_x_elite"
+$base = "https://qaihub-public-assets.s3.us-west-2.amazonaws.com/qai-hub-models/models/$modelId/releases"
 $revision = '41f01f3fe87f28c78e2fbf8b568835947dd65ed9'
 $openAi = "https://huggingface.co/openai/whisper-large-v3-turbo/resolve/$revision"
 $support = @{
@@ -59,7 +70,7 @@ if (Test-Path -LiteralPath $manifest) {
     $downloaded = -not $Archive
     if ($downloaded) {
         $Archive = Join-Path $root "$asset-$release.zip"
-        if (-not (Test-Path -LiteralPath $Archive) -or (Get-Item -LiteralPath $Archive).Length -ne 823697025) {
+        if (-not (Test-Path -LiteralPath $Archive) -or (Get-Item -LiteralPath $Archive).Length -ne $archiveSize) {
             Invoke-Checked 'curl.exe' @(
                 '--fail', '--location', '--retry', '3', '--continue-at', '-',
                 '--output', $Archive, "$base/$release/$asset.zip"
@@ -110,7 +121,10 @@ Invoke-Checked 'uv' @(
 
 $worker = Join-Path $PSScriptRoot 'whisper_qnn.py'
 $response = '{"id":1,"method":"initialize"}' | & $python -u $worker --model-dir $modelDir | ConvertFrom-Json
-if ($LASTEXITCODE -ne 0 -or -not $response -or -not $response.PSObject.Properties['result'] -or $response.result.device -ne 'htp') {
+if (
+    $LASTEXITCODE -ne 0 -or -not $response -or -not $response.PSObject.Properties['result'] -or
+    $response.result.device -ne 'htp' -or $response.result.precision -ne $Precision
+) {
     throw "The Whisper QNN worker failed to initialize: $($response | ConvertTo-Json -Compress)"
 }
 Write-Output "Whisper QNN is ready. Worker: $worker"
