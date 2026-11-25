@@ -21,7 +21,7 @@ PROFILES = {
         "models-unified-qnn",
         {
             "model": "Parakeet Unified English 0.6B (NPU encoder and decoder)",
-            "graph_devices": {"encoder": "htp", "decoder_joint": "htp", "preprocessor": "cpu"},
+            "graph_devices": {"encoder": "htp", "decoder_joint": "htp"},
             "encoder_length_masks": True,
             "encoder_precompiled": True,
         },
@@ -84,7 +84,12 @@ def verify(profile):
         "cpu_fallback": False,
         **identity,
     }
-    if any(result.get(key) != value for key, value in expected.items()):
+    graph_devices = expected.pop("graph_devices", {})
+    actual_graph_devices = result.get("graph_devices", {})
+    if (
+        any(result.get(key) != value for key, value in expected.items())
+        or any(actual_graph_devices.get(graph) != device for graph, device in graph_devices.items())
+    ):
         raise RuntimeError(f"The worker did not initialize the expected QNN model profile {profile!r}.")
     return result["model"]
 

@@ -81,7 +81,20 @@ The configured process skips Hex's optional Silero detector.
 The ordinary low-level silence and short-tap checks still apply to dictation.
 QNN works on finished audio, so streaming live text is unavailable.
 
-The CPU handles loading, windowing, audio features, and token selection.
+On an existing Unified installation, run
+`scripts/snapdragon/setup-parakeet-unified.ps1 -Optimize`, then rerun
+`scripts/snapdragon/install-launcher.ps1` and restart Hex. Setup compiles the
+extra QNN graphs under the model's `acceleration` directory. The worker uses
+them automatically when present. The encoder and its model weights are reused.
+
+Optimized Unified scores four frames per decoder call and chooses the token
+IDs on the NPU. It recomputes scores from the first emitted token when the
+predictor state changes. The NPU also computes spectral and mel energy using
+the smallest available window that fits the audio. Windows under 1.6 seconds
+use the CPU frontend to avoid dispatch overhead. The CPU handles audio
+loading, windowing, pre-emphasis, log and feature normalization, the decoding
+loop, and text assembly. Other profiles use their original audio preparation
+and token selection.
 Every graph assigned to QNN has CPU fallback disabled.
 
 A missing model, worker startup failure, or failed transcription reports
@@ -90,6 +103,13 @@ still use that catalog model. The standalone file command opens its own worker
 and can consume NPU memory alongside the listener.
 
 ## Local verification
+
+Across two replay rounds of the same 108 English recordings, the installed
+optimized worker averaged 11.80 seconds of CPU time, down from 16.30 seconds.
+Its wall time ranged from 13.95 to 25.92 seconds. Both workers scored 9.60%
+word error rate. One word differed in one clip. The four-frame decoder alone
+matched all transcripts and segment timestamps. These times exclude worker
+startup, app capture, and pasting.
 
 On a Snapdragon X Plus X1P42100, Parakeet Unified English recorded QNN
 accelerator execution for all 12 encoder stages and its RNNT predictor/joint

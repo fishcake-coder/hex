@@ -8,6 +8,7 @@ from tempfile import TemporaryDirectory
 from urllib.request import urlopen
 
 import onnx
+from onnx import TensorProto, helper
 
 
 SOURCE = "https://huggingface.co/bobNight/parakeet-unified-en-0.6b-onnx/resolve/09e9060322d99c5f070010724786e6ee090fd51d"
@@ -61,7 +62,24 @@ def fix_dimensions(values, shapes):
             dim.dim_value = size
 
 
-def freeze_decoder(directory, destination):
+def add_token_selection(graph):
+    logits = next(output for output in graph.output if output.name == "outputs")
+    token_shape = [dimension.dim_value for dimension in logits.type.tensor_type.shape.dim[:-1]]
+    graph.output.remove(logits)
+    graph.output.insert(0, helper.make_tensor_value_info("token_id", TensorProto.INT32, token_shape))
+    graph.node.extend([
+        # NumPy argmax takes the first index when maximum scores tie.
+        helper.make_node(
+            "ArgMax", ["outputs"], ["token_id_int64"], name="rnnt_token_argmax",
+            axis=-1, keepdims=0, select_last_index=0,
+        ),
+        helper.make_node(
+            "Cast", ["token_id_int64"], ["token_id"], name="rnnt_token_int32", to=TensorProto.INT32,
+        ),
+    ])
+
+
+def freeze_decoder(directory, destination, token_output=False, frame_count=1):
     model = onnx.load(directory / "decoder_joint.onnx")
     graph = model.graph
     # The prediction length is passed through unchanged. The fixed RNNT
@@ -73,8 +91,10 @@ def freeze_decoder(directory, destination):
     ):
         (index,) = (index for index, value in enumerate(group) if obsolete(value))
         del group[index]
-    fix_dimensions(graph.input, INPUTS)
-    fix_dimensions(graph.output, OUTPUTS)
+    fix_dimensions(graph.input, INPUTS | {"encoder_outputs": (1, 1024, frame_count)})
+    fix_dimensions(graph.output, OUTPUTS | {"outputs": (1, frame_count, 1, 1025)})
+    if token_output:
+        add_token_selection(graph)
     model = onnx.shape_inference.infer_shapes(model, strict_mode=True, data_prop=True)
     onnx.checker.check_model(model)
     partial = destination.with_suffix(".onnx.partial")
@@ -85,14 +105,14 @@ def freeze_decoder(directory, destination):
         partial.unlink(missing_ok=True)
 
 
-def compile_decoder(directory, destination):
+def compile_decoder(directory, destination, token_output=False, frame_count=1):
     from prepare_unified_encoder import QnnContextCompiler
 
     with TemporaryDirectory(prefix="unified-decoder-", dir=directory) as temporary:
         scratch = Path(temporary)
         raw = scratch / "decoder-uncompiled.onnx"
         cached = scratch / destination.name
-        freeze_decoder(directory, raw)
+        freeze_decoder(directory, raw, token_output, frame_count)
         QnnContextCompiler().export(raw, cached)
         raw.unlink()
         for path in scratch.iterdir():
@@ -105,6 +125,9 @@ def main():
     parser = ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--compile-context", action="store_true")
+    parser.add_argument("--token-output", action="store_true", help="Select the greedy token inside the graph.")
+    parser.add_argument("--frame-count", type=int, choices=(1, 4), default=1,
+                        help="Number of encoder frames to score with the same predictor state.")
     args = parser.parse_args()
     directory = args.model_dir.resolve()
     directory.mkdir(parents=True, exist_ok=True)
@@ -113,9 +136,9 @@ def main():
     if args.compile_context:
         if destination.exists():
             raise FileExistsError(f"A fixed decoder already exists at {destination}")
-        compile_decoder(directory, destination)
+        compile_decoder(directory, destination, args.token_output, args.frame_count)
     else:
-        freeze_decoder(directory, destination)
+        freeze_decoder(directory, destination, args.token_output, args.frame_count)
     print(f"Prepared {destination}")
 
 

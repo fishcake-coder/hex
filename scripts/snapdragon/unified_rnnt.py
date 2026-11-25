@@ -43,6 +43,8 @@ def mel_filterbank():
 
 
 class Frontend:
+    device = "cpu"
+
     def __init__(self, mel_frames):
         self.mel_frames = mel_frames
         self.filters = mel_filterbank()
@@ -61,11 +63,66 @@ class Frontend:
         windows = np.lib.stride_tricks.sliding_window_view(centered, FFT_SIZE)[::HOP_SIZE][:length]
         fft = np.fft.rfft(windows * self.window)
         spectrum = (fft.real ** 2 + fft.imag ** 2).astype(np.float32)
-        log_mel = np.log(self.filters @ spectrum.T + np.float32(2 ** -24))
-        centered_mel = log_mel - log_mel[:, :1]
-        centered_mel -= centered_mel.mean(axis=1, keepdims=True)
-        std = np.sqrt(np.sum(centered_mel ** 2, axis=1, keepdims=True) / (length - 1))
-        features[0, :, :length] = centered_mel / (std + np.float32(1e-5))
+        features[0, :, :length] = normalize_mel(self.filters @ spectrum.T, length)
+        return features, length
+
+
+def normalize_mel(energy, length):
+    log_mel = np.log(energy + np.float32(2 ** -24))
+    centered_mel = log_mel - log_mel[:, :1]
+    centered_mel -= centered_mel.mean(axis=1, keepdims=True)
+    std = np.sqrt(np.sum(centered_mel ** 2, axis=1, keepdims=True) / (length - 1))
+    return centered_mel / (std + np.float32(1e-5))
+
+
+class QnnSpectralFrontend(Frontend):
+    device = "cpu+htp"
+
+    def __init__(self, models, runtime, mel_frames):
+        super().__init__(mel_frames)
+        self.sessions = {}
+        for frames, path in models:
+            session = runtime.session(path)
+            inputs = {node.name: (node.type, node.shape) for node in session.get_inputs()}
+            outputs = {node.name: (node.type, node.shape) for node in session.get_outputs()}
+            waveform = ("tensor(float)", [1, 1, 1, frames * HOP_SIZE])
+            spectrum = ("tensor(float)", [1, MEL_BINS, frames])
+            if (
+                inputs != {"waveform_high": waveform, "waveform_low": waveform}
+                or outputs != {"mel_high": spectrum, "mel_low": spectrum}
+            ):
+                raise ValueError(f"Unexpected tensors in Unified frontend graph {path.name}")
+            self.sessions[frames] = session
+
+    def encode(self, audio):
+        length = len(audio) // HOP_SIZE
+        # For very short windows the NumPy frontend avoids a dispatch overhead.
+        if length < 160:
+            return super().encode(audio)
+        frames = next((size for size in self.sessions if size * HOP_SIZE >= len(audio)), None)
+        if frames is None:
+            return super().encode(audio)
+
+        preemphasis = np.zeros(frames * HOP_SIZE, dtype=np.float32)
+        samples = len(audio)
+        preemphasis[0] = audio[0]
+        preemphasis[1:samples] = audio[1:] - np.float32(0.97) * audio[:-1]
+        peak = np.abs(preemphasis[:samples]).max()
+        gain = np.float32(np.clip(0.25 / peak, 1, 128)) if peak else np.float32(1)
+        preemphasis[:samples] *= gain
+        coarse = preemphasis.astype(np.float16).astype(np.float32)
+        # Keep the discarded FP16 bits in a second input so quiet audio retains
+        # the precision required by the model's log and variance operations.
+        residual = (preemphasis - coarse) * np.float32(2048)
+        high, low = self.sessions[frames].run(["mel_high", "mel_low"], {
+            "waveform_high": coarse.reshape(1, 1, 1, -1),
+            "waveform_low": residual.reshape(1, 1, 1, -1),
+        })
+        high, low = high[0, :, :length], low[0, :, :length]
+        power = np.where(high >= 2 ** -14, high, low * np.float32(1 / 128 ** 2))
+        energy = power * np.float32(8 / gain ** 2)
+        features = np.zeros((1, MEL_BINS, self.mel_frames), dtype=np.float32)
+        features[0, :, :length] = normalize_mel(energy, length)
         return features, length
 
 
@@ -83,18 +140,32 @@ class RnntDecoder:
             for token in vocab
         ]
 
-        self.session = runtime.session(model_dir / "decoder-joint-static.onnx")
+        token_model = model_dir / "acceleration" / "decoder-joint-static.onnx"
+        self.selects_token_on_npu = token_model.is_file()
+        decoder_model = token_model if self.selects_token_on_npu else model_dir / "decoder-joint-static.onnx"
+        if not decoder_model.is_file():
+            raise FileNotFoundError(f"Missing the Unified QNN decoder in {model_dir}. Run setup-parakeet-unified.ps1.")
+        self.session = runtime.session(decoder_model)
+        self.prediction_output = "token_id" if self.selects_token_on_npu else "outputs"
         inputs = {node.name: (node.type, node.shape) for node in self.session.get_inputs()}
+        self.frames_per_step = inputs["encoder_outputs"][1][-1]
+        if self.frames_per_step not in (1, 4) or (
+            not self.selects_token_on_npu and self.frames_per_step != 1
+        ):
+            raise ValueError("Unsupported Unified decoder frame count")
         outputs = {node.name: (node.type, node.shape) for node in self.session.get_outputs()}
         state = ("tensor(float)", [2, 1, 640])
         expected_inputs = {
-            "encoder_outputs": ("tensor(float)", [1, ENCODER_WIDTH, 1]),
+            "encoder_outputs": ("tensor(float)", [1, ENCODER_WIDTH, self.frames_per_step]),
             "targets": ("tensor(int32)", [1, 1]),
             "input_states_1": state,
             "input_states_2": state,
         }
         expected_outputs = {
-            "outputs": ("tensor(float)", [1, 1, 1, BLANK + 1]),
+            self.prediction_output: (
+                ("tensor(int32)", [1, self.frames_per_step, 1]) if self.selects_token_on_npu
+                else ("tensor(float)", [1, 1, 1, BLANK + 1])
+            ),
             "output_states_1": state,
             "output_states_2": state,
         }
@@ -102,24 +173,67 @@ class RnntDecoder:
             raise ValueError("The decoder tensors differ from the Parakeet Unified English export")
 
     def decode(self, encoded, frames):
+        if self.frames_per_step > 1:
+            return self.decode_batches(encoded, frames)
         target = np.full((1, 1), BLANK, dtype=np.int32)
         state1 = np.zeros((2, 1, 640), dtype=np.float32)
         state2 = np.zeros_like(state1)
         feeds = {"targets": target}
+        output_names = [self.prediction_output, "output_states_1", "output_states_2"]
         emitted = []
         for frame in range(frames):
             activation = np.ascontiguousarray(encoded[:, :, frame:frame + 1])
             for _ in range(MAX_SYMBOLS_PER_FRAME):
                 feeds.update(encoder_outputs=activation, input_states_1=state1, input_states_2=state2)
-                scores, next_state1, next_state2 = self.session.run(
-                    ["outputs", "output_states_1", "output_states_2"], feeds,
-                )
-                token = int(np.argmax(scores))
+                prediction, next_state1, next_state2 = self.session.run(output_names, feeds)
+                token = prediction.item() if self.selects_token_on_npu else int(np.argmax(prediction))
                 if token == BLANK:
                     break
                 emitted.append(self.pieces[token])
                 state1, state2 = next_state1, next_state2
                 target.fill(token)
+        return " ".join("".join(emitted).split())
+
+
+    def decode_batches(self, encoded, frames):
+        step = self.frames_per_step
+        activation = np.zeros((1, ENCODER_WIDTH, step), dtype=np.float32)
+        target = np.full((1, 1), BLANK, dtype=np.int32)
+        state1 = np.zeros((2, 1, 640), dtype=np.float32)
+        state2 = np.zeros_like(state1)
+        feeds = {"encoder_outputs": activation, "targets": target}
+        output_names = ["token_id", "output_states_1", "output_states_2"]
+        emitted = []
+        frame = 0
+        symbols_at_frame = 0
+        while frame < frames:
+            count = min(step, frames - frame)
+            activation[:, :, :count] = encoded[:, :, frame:frame + count]
+            activation[:, :, count:] = 0
+            feeds.update(input_states_1=state1, input_states_2=state2)
+            labels, next_state1, next_state2 = self.session.run(output_names, feeds)
+
+            # The predictor stays fixed over leading blanks. Scores for any frame
+            # beyond the first emitted token use stale predictor state.
+            for index, value in enumerate(labels[0, :count, 0]):
+                token = int(value)
+                if token != BLANK:
+                    break
+            else:
+                frame += count
+                symbols_at_frame = 0
+                continue
+
+            if index:
+                frame += index
+                symbols_at_frame = 0
+            emitted.append(self.pieces[token])
+            target.fill(token)
+            state1, state2 = next_state1, next_state2
+            symbols_at_frame += 1
+            if symbols_at_frame == MAX_SYMBOLS_PER_FRAME:
+                frame += 1
+                symbols_at_frame = 0
         return " ".join("".join(emitted).split())
 
 
@@ -278,21 +392,29 @@ def has_sustained_voiced_energy(audio):
 
 class Unified:
     def __init__(self, model_dir, profile_dir):
-        if not (model_dir / "decoder-joint-static.onnx").is_file():
-            raise FileNotFoundError(f"Missing the Unified QNN decoder in {model_dir}. Run setup-parakeet-unified.ps1.")
         self.runtime = QnnRuntime(profile_dir)
         try:
             self.decoder = RnntDecoder(model_dir, self.runtime)
             self.encoder = QnnEncoder(model_dir, self.runtime)
+            frontend_models = []
+            for frames in sorted({256, 512, self.encoder.mel_frames}):
+                path = model_dir / "acceleration" / f"frontend-{frames}.onnx"
+                if frames <= self.encoder.mel_frames and path.is_file():
+                    frontend_models.append((frames, path))
+            self.frontend = (
+                QnnSpectralFrontend(frontend_models, self.runtime, self.encoder.mel_frames)
+                if frontend_models else Frontend(self.encoder.mel_frames)
+            )
         except Exception:
             self.runtime.close()
             raise
-        self.frontend = Frontend(self.encoder.mel_frames)
         self.info = self.runtime.info | {
             "model": "Parakeet Unified English 0.6B (NPU encoder and decoder)",
             "languages": ["en"],
             "architecture": platform.machine(),
-            "graph_devices": {"encoder": "htp", "decoder_joint": "htp", "preprocessor": "cpu"},
+            "graph_devices": {"encoder": "htp", "decoder_joint": "htp", "preprocessor": self.frontend.device},
+            "token_selection": "htp" if self.decoder.selects_token_on_npu else "cpu",
+            "decoder_frames_per_step": self.decoder.frames_per_step,
             "encoder_stages": len(self.encoder.sessions),
             "encoder_length_masks": True,
             "encoder_precompiled": self.encoder.precompiled,

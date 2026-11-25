@@ -6,7 +6,8 @@ param(
     [ValidateRange(8, 2400)]
     [int]$MelFrames = 1280,
     [ValidateRange(1, 4)]
-    [int]$LayersPerStage = 2
+    [int]$LayersPerStage = 2,
+    [switch]$Optimize
 )
 
 $ErrorActionPreference = 'Stop'
@@ -24,6 +25,75 @@ function Assert-Sha256 {
     param([string]$Path, [string]$Sha256)
     if ((Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash -ne $Sha256) {
         throw "SHA-256 verification failed for $Path"
+    }
+}
+
+function Install-Acceleration {
+    param([string]$ModelPath, [string]$RuntimeRoot)
+
+    $destination = Join-Path $ModelPath 'acceleration'
+    $frontendWindows = @(
+        @(256, 512, $MelFrames) | Where-Object { $_ -ge 160 -and $_ -le $MelFrames } | Sort-Object -Unique
+    )
+    $assetNames = @('decoder-joint-static.onnx', 'decoder-joint-static_qnn.bin')
+    foreach ($frames in $frontendWindows) {
+        $assetNames += "frontend-$frames.onnx", "frontend-${frames}_qnn.bin"
+    }
+    if (Test-Path -LiteralPath $destination) {
+        $hashes = Get-Content -LiteralPath (Join-Path $destination 'sha256.json') -Raw | ConvertFrom-Json
+        foreach ($name in $assetNames) {
+            Assert-Sha256 (Join-Path $destination $name) $hashes.$name
+        }
+        return
+    }
+
+    $uv = (Get-Command uv -ErrorAction Stop).Source
+    $python = Join-Path $RuntimeRoot 'venv\Scripts\python.exe'
+    $toolDir = Join-Path $RuntimeRoot 'unified-converter-python'
+    $build = Join-Path $ModelPath ('acceleration-build-' + [guid]::NewGuid().ToString('N'))
+    New-Item -Path $build -ItemType Directory | Out-Null
+    $previousPythonPath = $env:PYTHONPATH
+    $sourceNames = @('decoder_joint.onnx', 'vocab.txt')
+    try {
+        Invoke-Checked $uv @(
+            'pip', 'install', '--python', $python, '--target', $toolDir, '--no-cache', 'onnx==1.23.2'
+        )
+        $env:PYTHONPATH = $toolDir
+        foreach ($name in $sourceNames) {
+            Copy-Item -LiteralPath (Join-Path $ModelPath $name) -Destination $build
+        }
+        Invoke-Checked $python @(
+            '-B', (Join-Path $PSScriptRoot 'prepare_unified_decoder.py'),
+            '--model-dir', $build, '--compile-context', '--token-output', '--frame-count', '4'
+        )
+        if ($frontendWindows.Count -gt 0) {
+            Invoke-Checked $python (@(
+                '-B', (Join-Path $PSScriptRoot 'prepare_unified_frontend.py'),
+                '--model-dir', $build, '--mel-frames'
+            ) + $frontendWindows)
+        }
+        $hashes = [ordered]@{}
+        foreach ($name in $assetNames) {
+            $hashes[$name] = (Get-FileHash -LiteralPath (Join-Path $build $name) -Algorithm SHA256).Hash
+        }
+        $hashes | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $build 'sha256.json') -Encoding UTF8
+        foreach ($name in $sourceNames) {
+            Remove-Item -LiteralPath (Join-Path $build $name)
+        }
+        [System.IO.Directory]::Move($build, $destination)
+    } finally {
+        $env:PYTHONPATH = $previousPythonPath
+        if (Test-Path -LiteralPath $build -PathType Container) {
+            foreach ($name in $assetNames + $sourceNames + @('sha256.json')) {
+                $path = Join-Path $build $name
+                if (Test-Path -LiteralPath $path -PathType Leaf) {
+                    Remove-Item -LiteralPath $path
+                }
+            }
+            if (-not (Get-ChildItem -LiteralPath $build -Force)) {
+                Remove-Item -LiteralPath $build
+            }
+        }
     }
 }
 
@@ -59,6 +129,7 @@ if (Test-Path -LiteralPath $verified -PathType Leaf) {
     ) {
         throw "The installed encoder uses a different build. Pass a new -ModelDir: $ModelDir"
     }
+    if ($Optimize) { Install-Acceleration $ModelDir $root }
     Write-Output $ModelDir
     return
 }
@@ -141,6 +212,7 @@ try {
         $hashes[$file.Name] = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
     }
     $hashes | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $stage 'sha256.json') -Encoding UTF8
+    if ($Optimize) { Install-Acceleration $stage $root }
     [System.IO.Directory]::Move($stage, $ModelDir)
     Write-Output $ModelDir
 } finally {
