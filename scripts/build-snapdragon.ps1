@@ -2,7 +2,8 @@
 param(
     [string]$LlvmBin,
     [ValidateRange(1, 32)][int]$Jobs = 5,
-    [switch]$Clippy
+    [switch]$Clippy,
+    [switch]$BuildOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -78,6 +79,10 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Cargo exited with code $LASTEXITCODE." }
 
     $release = Join-Path $targetDir "$target\release"
+    if ($BuildOnly) {
+        Write-Host "Built $release\hex.exe and $release\hex-console.exe."
+        return
+    }
     New-Item -ItemType Directory -Path $bin -Force | Out-Null
     Copy-Item -LiteralPath (Join-Path $release 'hex.exe') -Destination (Join-Path $bin 'hex.exe')
     Copy-Item -LiteralPath (Join-Path $release 'hex-console.exe') -Destination (Join-Path $bin 'hex.com')

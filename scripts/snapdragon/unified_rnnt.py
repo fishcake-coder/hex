@@ -23,6 +23,8 @@ BLANK = 1024
 MAX_SYMBOLS_PER_FRAME = 10
 TRAILING_SILENCE_SAMPLES = 400 * SAMPLE_RATE // 1000
 QNN_PROVIDER = "QNNExecutionProvider"
+STREAM_GEOMETRY = (70, 7, 7)
+MAX_STREAM_PUSH_SAMPLES = SAMPLE_RATE
 
 
 def mel_filterbank():
@@ -61,10 +63,13 @@ class Frontend:
         preemphasis[1:] -= np.float32(0.97) * audio[:-1]
         centered = np.pad(preemphasis, FFT_SIZE // 2)
         windows = np.lib.stride_tricks.sliding_window_view(centered, FFT_SIZE)[::HOP_SIZE][:length]
+        features[0, :, :length] = normalize_mel(self.mel_energy(windows), length)
+        return features, length
+
+    def mel_energy(self, windows):
         fft = np.fft.rfft(windows * self.window)
         spectrum = (fft.real ** 2 + fft.imag ** 2).astype(np.float32)
-        features[0, :, :length] = normalize_mel(self.filters @ spectrum.T, length)
-        return features, length
+        return self.filters @ spectrum.T
 
 
 def normalize_mel(energy, length):
@@ -126,8 +131,66 @@ class QnnSpectralFrontend(Frontend):
         return features, length
 
 
+class IncrementalMel:
+    """Extract centered mel energy once and keep only the unprocessed PCM tail."""
+
+    def __init__(self, frontend):
+        self.frontend = frontend
+        self.tail = np.zeros(FFT_SIZE // 2, dtype=np.float32)
+        self.previous = None
+
+    def push(self, audio):
+        if len(audio) == 0:
+            return np.empty((MEL_BINS, 0), dtype=np.float32)
+        samples = audio.copy()
+        if self.previous is not None:
+            samples[0] -= np.float32(0.97) * self.previous
+        samples[1:] -= np.float32(0.97) * audio[:-1]
+        self.previous = audio[-1]
+        buffered = np.concatenate((self.tail, samples))
+        if len(buffered) < FFT_SIZE:
+            self.tail = buffered
+            return np.empty((MEL_BINS, 0), dtype=np.float32)
+        windows = np.lib.stride_tricks.sliding_window_view(buffered, FFT_SIZE)[::HOP_SIZE]
+        self.tail = buffered[len(windows) * HOP_SIZE:].copy()
+        return self.frontend.mel_energy(windows)
+
+    def window_energy(self, audio, interior, frame_count):
+        # A buffered NeMo window centers its STFT and applies pre-emphasis
+        # from the window's start. Recompute only frames touching either edge.
+        edge = (WINDOW_SIZE // 2 + HOP_SIZE - 1) // HOP_SIZE
+        left = min(edge, frame_count)
+        right = max(left, frame_count - edge)
+        border = np.r_[0:left, right:frame_count]
+        indices = border[:, None] * HOP_SIZE + np.arange(-FFT_SIZE // 2, FFT_SIZE // 2)
+        samples = audio[np.clip(indices, 0, len(audio) - 1)]
+        previous = audio[np.clip(indices - 1, 0, len(audio) - 1)]
+        samples -= np.float32(0.97) * np.where(indices > 0, previous, np.float32(0))
+        windows = np.where((indices >= 0) & (indices < len(audio)), samples, np.float32(0))
+        energy = np.empty((MEL_BINS, frame_count), dtype=np.float32)
+        energy[:, left:right] = interior[:, left:right]
+        energy[:, border] = self.frontend.mel_energy(windows)
+        return energy
+
+
+class RnntState:
+    def __init__(self):
+        self.target = np.full((1, 1), BLANK, dtype=np.int32)
+        self.state1 = np.zeros((2, 1, 640), dtype=np.float32)
+        self.state2 = np.zeros_like(self.state1)
+        self.pieces = []
+
+    def emit(self, token, piece, state1, state2):
+        self.pieces.append(piece)
+        self.target.fill(token)
+        self.state1, self.state2 = state1, state2
+
+    def text(self):
+        return " ".join("".join(self.pieces).split())
+
+
 class RnntDecoder:
-    """Run the matching offline predictor and joint network."""
+    """Run the same predictor and joint network for clips and streams."""
 
     def __init__(self, model_dir, runtime):
         # The export's vocab omits SentencePiece ID 0 and writes continuation
@@ -173,44 +236,38 @@ class RnntDecoder:
             raise ValueError("The decoder tensors differ from the Parakeet Unified English export")
 
     def decode(self, encoded, frames):
+        state = RnntState()
+        self.advance(encoded, frames, state)
+        return state.text()
+
+    def advance(self, encoded, frames, state):
         if self.frames_per_step > 1:
-            return self.decode_batches(encoded, frames)
-        target = np.full((1, 1), BLANK, dtype=np.int32)
-        state1 = np.zeros((2, 1, 640), dtype=np.float32)
-        state2 = np.zeros_like(state1)
-        feeds = {"targets": target}
+            self.advance_batches(encoded, frames, state)
+            return
+        feeds = {"targets": state.target}
         output_names = [self.prediction_output, "output_states_1", "output_states_2"]
-        emitted = []
         for frame in range(frames):
             activation = np.ascontiguousarray(encoded[:, :, frame:frame + 1])
             for _ in range(MAX_SYMBOLS_PER_FRAME):
-                feeds.update(encoder_outputs=activation, input_states_1=state1, input_states_2=state2)
+                feeds.update(encoder_outputs=activation, input_states_1=state.state1, input_states_2=state.state2)
                 prediction, next_state1, next_state2 = self.session.run(output_names, feeds)
                 token = prediction.item() if self.selects_token_on_npu else int(np.argmax(prediction))
                 if token == BLANK:
                     break
-                emitted.append(self.pieces[token])
-                state1, state2 = next_state1, next_state2
-                target.fill(token)
-        return " ".join("".join(emitted).split())
+                state.emit(token, self.pieces[token], next_state1, next_state2)
 
-
-    def decode_batches(self, encoded, frames):
+    def advance_batches(self, encoded, frames, state):
         step = self.frames_per_step
         activation = np.zeros((1, ENCODER_WIDTH, step), dtype=np.float32)
-        target = np.full((1, 1), BLANK, dtype=np.int32)
-        state1 = np.zeros((2, 1, 640), dtype=np.float32)
-        state2 = np.zeros_like(state1)
-        feeds = {"encoder_outputs": activation, "targets": target}
+        feeds = {"encoder_outputs": activation, "targets": state.target}
         output_names = ["token_id", "output_states_1", "output_states_2"]
-        emitted = []
         frame = 0
         symbols_at_frame = 0
         while frame < frames:
             count = min(step, frames - frame)
             activation[:, :, :count] = encoded[:, :, frame:frame + count]
             activation[:, :, count:] = 0
-            feeds.update(input_states_1=state1, input_states_2=state2)
+            feeds.update(input_states_1=state.state1, input_states_2=state.state2)
             labels, next_state1, next_state2 = self.session.run(output_names, feeds)
 
             # The predictor stays fixed over leading blanks. Scores for any frame
@@ -227,14 +284,11 @@ class RnntDecoder:
             if index:
                 frame += index
                 symbols_at_frame = 0
-            emitted.append(self.pieces[token])
-            target.fill(token)
-            state1, state2 = next_state1, next_state2
+            state.emit(token, self.pieces[token], next_state1, next_state2)
             symbols_at_frame += 1
             if symbols_at_frame == MAX_SYMBOLS_PER_FRAME:
                 frame += 1
                 symbols_at_frame = 0
-        return " ".join("".join(emitted).split())
 
 
 class QnnRuntime:
@@ -275,10 +329,11 @@ class QnnRuntime:
             "offload_graph_io_quantization": "0",
         }
         if self.profile_dir:
+            stem = f"streaming-{path.stem}" if path.parent.name == "streaming" else path.stem
             provider_options["profiling_level"] = "basic"
-            provider_options["profiling_file_path"] = str(self.profile_dir / f"{path.stem}-qnn.csv")
+            provider_options["profiling_file_path"] = str(self.profile_dir / f"{stem}-qnn.csv")
             opts.enable_profiling = True
-            opts.profile_file_prefix = str(self.profile_dir / f"{path.stem}-ort")
+            opts.profile_file_prefix = str(self.profile_dir / f"{stem}-ort")
         opts.add_provider_for_devices([self.device], provider_options)
         session = self.ort.InferenceSession(str(path), sess_options=opts, enable_fallback=False)
         if QNN_PROVIDER not in session.get_providers():
@@ -286,14 +341,19 @@ class QnnRuntime:
         self.sessions.append(session)
         return session
 
-    def close(self):
+    def release_after(self, retained):
+        sessions = self.sessions[retained:]
+        del self.sessions[retained:]
         if self.profile_dir:
-            for session in self.sessions:
+            for session in sessions:
                 session.end_profiling()
+
+    def close(self):
+        self.release_after(0)
 
 
 class QnnEncoder:
-    def __init__(self, model_dir, runtime):
+    def __init__(self, model_dir, runtime, streaming=False):
         manifest = json.loads((model_dir / "encoder-manifest.json").read_text(encoding="utf-8-sig"))
         self.mel_frames = manifest["mel_frames"]
         self.encoder_frames = manifest["encoder_frames"]
@@ -306,6 +366,15 @@ class QnnEncoder:
             or not manifest["stages"]
         ):
             raise ValueError("Invalid Parakeet Unified encoder window in the manifest")
+        self.chunk_attention = None
+        if streaming:
+            geometry = (manifest["left_frames"], manifest["chunk_frames"], manifest["right_frames"])
+            if geometry != STREAM_GEOMETRY or sum(geometry) != self.encoder_frames:
+                raise ValueError("Unexpected geometry in the Unified streaming encoder manifest")
+            left, chunk, right = geometry
+            frames = np.arange(self.encoder_frames)
+            block = frames[:, None] // chunk * chunk
+            self.chunk_attention = (frames < block - left) | (frames >= block + chunk + right)
         self.sessions = []
         input_shape = [1, MEL_BINS, self.mel_frames]
         stages = manifest["stages"]
@@ -343,25 +412,106 @@ class QnnEncoder:
                 specs[f"subsampling_valid_{i}"] = ("tensor(float)", [1, 1, self.mel_frames >> i, 1])
         return specs
 
-    def masks(self, valid):
-        invalid = np.arange(self.encoder_frames) >= (valid + SUBSAMPLING - 1) // SUBSAMPLING
+    def masks(self, valid, first=0, *, chunked=True):
+        end = first + valid
+        frames = np.arange(self.encoder_frames)
+        invalid = (frames < first // SUBSAMPLING) | (frames >= (end + SUBSAMPLING - 1) // SUBSAMPLING)
+        attention = invalid[:, None] | invalid[None, :]
+        if chunked and self.chunk_attention is not None:
+            attention |= self.chunk_attention
         masks = {
-            "attention_padding": (invalid[:, None] | invalid[None, :])[None, None, :, :],
+            "attention_padding": attention[None, None, :, :],
             "convolution_padding": invalid[None, None, :],
         }
         for i in range(4):
-            valid_at_scale = (valid + (1 << i) - 1) >> i
-            active = np.arange(self.mel_frames >> i) < valid_at_scale
+            positions = np.arange(self.mel_frames >> i)
+            active = (positions >= (first >> i)) & (positions < ((end + (1 << i) - 1) >> i))
             masks[f"subsampling_valid_{i}"] = active.astype(np.float32)[None, None, :, None]
         return masks
 
-    def encode(self, features, valid):
-        masks = self.masks(valid)
+    def encode(self, features, valid, first=0, *, chunked=True):
+        masks = self.masks(valid, first, chunked=chunked)
         for session, input_name, output_name, mask_specs in self.sessions:
             feeds = {input_name: features}
             feeds.update((name, masks[name]) for name in mask_specs)
             (features,) = session.run([output_name], feeds)
         return features
+
+class BufferedStream:
+    def __init__(self, frontend, encoder, decoder):
+        self.extractor = IncrementalMel(frontend)
+        self.encoder = encoder
+        self.decoder = decoder
+        self.state = RnntState()
+        self.audio = np.empty(0, dtype=np.float32)
+        self.energy = np.empty((MEL_BINS, 0), dtype=np.float32)
+        self.history_start = 0
+        self.next_chunk = 0
+        self.received_samples = 0
+        self.heard_audio = False
+        self.left_mel, self.chunk_mel, self.right_mel = (frames * SUBSAMPLING for frames in STREAM_GEOMETRY)
+
+    def append(self, audio):
+        self.audio = np.concatenate((self.audio, audio))
+        self.energy = np.concatenate((self.energy, self.extractor.push(audio)), axis=1)
+        self.received_samples += len(audio)
+
+    def drain(self, final=False):
+        available = self.received_samples // HOP_SIZE
+        while self.next_chunk < available:
+            end = self.next_chunk + self.chunk_mel + self.right_mel
+            if final and available <= end:
+                # At end of input the buffered recipe decodes all remaining
+                # frames in this window, including the former lookahead.
+                end = available
+                center_length = end - self.next_chunk
+            elif available >= end:
+                center_length = self.chunk_mel
+            else:
+                break
+
+            if self.heard_audio:
+                self.decode_chunk(end, center_length)
+            self.next_chunk += center_length
+            retain = max(0, self.next_chunk - self.left_mel)
+            trim = retain - self.history_start
+            if trim:
+                self.audio = self.audio[trim * HOP_SIZE:].copy()
+                self.energy = self.energy[:, trim:].copy()
+                self.history_start = retain
+
+    def decode_chunk(self, end, center_length):
+        start = max(0, self.next_chunk - self.left_mel)
+        first = self.left_mel - (self.next_chunk - start)
+        length = end - start
+        if length < 2:
+            return
+        begin = start - self.history_start
+        stop = end - self.history_start
+        audio = self.audio[begin * HOP_SIZE:stop * HOP_SIZE]
+        energy = self.extractor.window_energy(audio, self.energy[:, begin:stop], length)
+        features = np.zeros((1, MEL_BINS, self.encoder.mel_frames), dtype=np.float32)
+        features[0, :, first:first + length] = normalize_mel(energy, length)
+        activation = self.encoder.encode(features, length, first)
+        center_frames = (center_length + SUBSAMPLING - 1) // SUBSAMPLING
+        center = self.left_mel // SUBSAMPLING
+        self.decoder.advance(activation[:, :, center:center + center_frames], center_frames, self.state)
+
+    def push(self, audio):
+        self.heard_audio = self.heard_audio or bool(np.any(audio))
+        self.append(audio)
+        self.drain()
+        return self.result()
+
+    def finish(self):
+        if self.heard_audio:
+            self.append(np.zeros(TRAILING_SILENCE_SAMPLES, dtype=np.float32))
+            self.drain(final=True)
+        return self.result()
+
+    def result(self):
+        return {"text": self.state.text(), "language": "en"}
+
 
 def cut_at_quiet(audio, max_samples):
     if len(audio) <= max_samples:
@@ -391,20 +541,30 @@ def has_sustained_voiced_energy(audio):
 
 
 class Unified:
-    def __init__(self, model_dir, profile_dir):
+    def __init__(self, model_dir, profile_dir, prefer_streaming=True):
+        self.model_dir = model_dir
+        self.stream_dir = model_dir / "streaming"
+        self.mode = None
+        self.encoder = None
+        self.frontend = None
+        self.stream = None
         self.runtime = QnnRuntime(profile_dir)
         try:
             self.decoder = RnntDecoder(model_dir, self.runtime)
-            self.encoder = QnnEncoder(model_dir, self.runtime)
-            frontend_models = []
-            for frames in sorted({256, 512, self.encoder.mel_frames}):
-                path = model_dir / "acceleration" / f"frontend-{frames}.onnx"
-                if frames <= self.encoder.mel_frames and path.is_file():
-                    frontend_models.append((frames, path))
-            self.frontend = (
-                QnnSpectralFrontend(frontend_models, self.runtime, self.encoder.mel_frames)
-                if frontend_models else Frontend(self.encoder.mel_frames)
+            self.core_sessions = len(self.runtime.sessions)
+            offline = json.loads((model_dir / "encoder-manifest.json").read_text(encoding="utf-8-sig"))
+            streaming = (
+                prefer_streaming and os.environ.get("HEX_STREAMING") != "0"
+                and (self.stream_dir / "encoder-manifest.json").is_file()
             )
+            if streaming:
+                try:
+                    self.load_encoder("streaming")
+                except Exception as error:
+                    print(f"Unified streaming encoder unavailable: {error}", file=sys.stderr)
+                    streaming = False
+            if not streaming:
+                self.load_encoder("offline")
         except Exception:
             self.runtime.close()
             raise
@@ -415,17 +575,96 @@ class Unified:
             "graph_devices": {"encoder": "htp", "decoder_joint": "htp", "preprocessor": self.frontend.device},
             "token_selection": "htp" if self.decoder.selects_token_on_npu else "cpu",
             "decoder_frames_per_step": self.decoder.frames_per_step,
-            "encoder_stages": len(self.encoder.sessions),
+            "encoder_stages": len(offline["stages"]),
             "encoder_length_masks": True,
-            "encoder_precompiled": self.encoder.precompiled,
-            "encoder_window_ms": self.encoder.mel_frames * HOP_SIZE * 1000 // SAMPLE_RATE,
+            "encoder_precompiled": offline.get("compiled_contexts", False),
+            "encoder_window_ms": offline["mel_frames"] * HOP_SIZE * 1000 // SAMPLE_RATE,
+            "streaming": streaming,
         }
+        if streaming:
+            frame_ms = SUBSAMPLING * HOP_SIZE * 1000 // SAMPLE_RATE
+            self.info["streaming_geometry_ms"] = dict(
+                zip(("left", "chunk", "right"), (frames * frame_ms for frames in STREAM_GEOMETRY), strict=True),
+            )
+
+    def load_encoder(self, mode):
+        if self.mode == mode:
+            return
+        self.mode = self.encoder = self.frontend = None
+        self.runtime.release_after(self.core_sessions)
+        try:
+            streaming = mode == "streaming"
+            model_dir = self.stream_dir if streaming else self.model_dir
+            encoder = QnnEncoder(model_dir, self.runtime, streaming=streaming)
+            frontend_models = []
+            if not streaming:
+                for frames in sorted({256, 512, encoder.mel_frames}):
+                    path = self.model_dir / "acceleration" / f"frontend-{frames}.onnx"
+                    if frames <= encoder.mel_frames and path.is_file():
+                        frontend_models.append((frames, path))
+            frontend = (
+                QnnSpectralFrontend(frontend_models, self.runtime, encoder.mel_frames)
+                if frontend_models else Frontend(encoder.mel_frames)
+            )
+        except Exception:
+            self.runtime.release_after(self.core_sessions)
+            raise
+        self.encoder, self.frontend, self.mode = encoder, frontend, mode
+
+    @staticmethod
+    def require_english(language):
+        if language not in (None, "auto", "en"):
+            raise ValueError(f"Parakeet Unified English does not support language {language!r}")
+
+    def stream_start(self, language):
+        self.require_english(language)
+        if not self.info["streaming"]:
+            raise RuntimeError("This Unified installation has no working streaming encoder")
+        if self.stream is not None:
+            raise RuntimeError("A Unified stream is already active")
+        self.load_encoder("streaming")
+        self.stream = BufferedStream(self.frontend, self.encoder, self.decoder)
+        return {}
+
+    def active_stream(self):
+        if self.stream is None:
+            raise RuntimeError("No Unified stream is active")
+        return self.stream
+
+    def stream_push(self, pcm):
+        stream = self.active_stream()
+        audio = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
+        try:
+            return stream.push(audio)
+        except Exception:
+            self.stream = None
+            raise
+
+    def stream_finish(self):
+        stream = self.active_stream()
+        self.stream = None
+        if stream.heard_audio and stream.received_samples <= 2 * SAMPLE_RATE:
+            # A short recording can finish before the second live step.
+            # Decode it with full context, including Unified's silence tail.
+            text = self.recognize(np.pad(stream.audio, (0, TRAILING_SILENCE_SAMPLES)))
+            if not text or not text.endswith((".", "?", "!")):
+                # Trailing silence sometimes leaves a partial final word.
+                # Accept the unpadded result if it completes that prefix.
+                unpadded = self.recognize(stream.audio)
+                if not text or (unpadded.startswith(text) and unpadded.endswith((".", "?", "!"))):
+                    text = unpadded
+            return {"text": text, "language": "en"}
+        return stream.finish()
+
+    def stream_cancel(self):
+        self.stream = None
+        return {}
 
     def recognize(self, audio):
         features, valid = self.frontend.encode(audio)
         if valid < 2:
             return ""
-        encoded = self.encoder.encode(features, valid)
+        encoded = self.encoder.encode(features, valid, chunked=False)
         return self.decoder.decode(encoded, (valid + SUBSAMPLING - 1) // SUBSAMPLING)
 
     def recognize_window(self, clip, window_samples):
@@ -456,12 +695,17 @@ class Unified:
                     yield start, end, text
 
     def transcribe(self, audio_path, language):
-        if language not in (None, "auto", "en"):
-            raise ValueError(f"Parakeet Unified English does not support language {language!r}")
+        self.require_english(language)
+        if self.stream is not None:
+            raise RuntimeError("Finish or cancel the active Unified stream before transcribing a file")
         with wave.open(str(audio_path), "rb") as wav:
             if (wav.getnchannels(), wav.getsampwidth(), wav.getframerate()) != (1, 2, SAMPLE_RATE):
                 raise ValueError("Expected a 16 kHz mono signed 16-bit PCM WAV")
             audio = np.frombuffer(wav.readframes(wav.getnframes()), dtype="<i2").astype(np.float32) / 32768.0
+        # The live graph uses the same encoder weights. Its full-context mask
+        # can recover a short recording without swapping all model contexts.
+        if self.mode != "streaming" or len(audio) > self.encoder.mel_frames * HOP_SIZE:
+            self.load_encoder("offline")
 
         offset = 0
         segments = []
@@ -488,30 +732,51 @@ def main():
     if profile_dir:
         profile_dir = Path(profile_dir).resolve()
         profile_dir.mkdir(parents=True, exist_ok=True)
-    sys.stdin.reconfigure(encoding="utf-8")
+    input_stream = sys.stdin.buffer
     sys.stdout.reconfigure(encoding="utf-8")
     worker = None
     try:
-        for line in sys.stdin:
+        for line in iter(input_stream.readline, b""):
             request_id = None
+            broken_frame = False
             try:
                 request = json.loads(line)
                 if not isinstance(request, dict):
                     raise ValueError("Expected a JSON request object")
                 request_id = request["id"]
                 method = request["method"]
+                if method == "stream_push":
+                    count = request.get("sample_count")
+                    if type(count) is not int or not 0 <= count <= MAX_STREAM_PUSH_SAMPLES:
+                        broken_frame = True
+                        raise ValueError(f"Expected zero to {MAX_STREAM_PUSH_SAMPLES} PCM samples per push")
+                    pcm = input_stream.read(count * 2)
+                    if len(pcm) != count * 2:
+                        broken_frame = True
+                        raise ValueError("Incomplete Unified stream PCM payload")
                 if method == "initialize":
                     if worker is None:
-                        worker = Unified(model_dir, profile_dir)
+                        worker = Unified(model_dir, profile_dir, request.get("streaming", True))
                     result = worker.info
                 elif method == "transcribe" and worker is not None:
                     result = worker.transcribe(request["audio_path"], request.get("language"))
+                elif method == "stream_start" and worker is not None:
+                    result = worker.stream_start(request.get("language"))
+                elif method == "stream_push" and worker is not None:
+                    result = worker.stream_push(pcm)
+                elif method == "stream_finish" and worker is not None:
+                    result = worker.stream_finish()
+                elif method == "stream_cancel" and worker is not None:
+                    result = worker.stream_cancel()
                 else:
                     raise ValueError(f"Invalid request for the current worker state: {method}")
                 response = {"id": request_id, "result": result}
             except Exception as error:
                 response = {"id": request_id, "error": str(error) or type(error).__name__}
             print(json.dumps(response, ensure_ascii=False), flush=True)
+            if broken_frame:
+                # A bad length leaves no reliable boundary for the next header.
+                break
     finally:
         if worker is not None:
             worker.runtime.close()

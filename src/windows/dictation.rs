@@ -239,6 +239,7 @@ pub fn run(
         Some(
             crate::transcription::snapdragon::Qnn::load(
                 &crate::transcription::snapdragon::language(),
+                true,
             )?
             .into(),
         )

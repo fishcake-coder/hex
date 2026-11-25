@@ -236,7 +236,7 @@ pub(super) const UNTRANSCRIBED_SPEECH_SAMPLES: usize = 4_800;
 /// capture's own sounds (the pre-roll, the start tone) are ignored at the
 /// head. A raw decode carrying two different language tags means it changed
 /// language mid-clip, so the whole clip decides too.
-pub(super) struct PauseCap<'a, S> {
+pub(super) struct PauseCap<'a, S: ?Sized> {
     stream: &'a mut S,
     speech: crate::transcription::pause_segmenter::SpeechFrames,
     /// Samples not yet a whole 20 ms frame.
@@ -262,7 +262,7 @@ pub(super) struct PauseCap<'a, S> {
     opening_slack: usize,
 }
 
-impl<'a, S: StreamFeed> PauseCap<'a, S> {
+impl<'a, S: StreamFeed + ?Sized> PauseCap<'a, S> {
     pub(super) fn new(stream: &'a mut S, trailing_silence: usize) -> Self {
         Self {
             stream,
@@ -321,7 +321,7 @@ impl<'a, S: StreamFeed> PauseCap<'a, S> {
     }
 }
 
-impl<S: StreamFeed> StreamFeed for PauseCap<'_, S> {
+impl<S: StreamFeed + ?Sized> StreamFeed for PauseCap<'_, S> {
     fn feed(&mut self, mut samples: &[f32]) -> Result<(), String> {
         let mut out = Vec::with_capacity(samples.len() + self.tail.len());
         while !samples.is_empty() {
@@ -619,7 +619,7 @@ pub(super) fn drive_stream(
 /// begin or finish, model work, shutdown) closes it and is returned.
 pub(super) fn drive_yielding(
     id: u64,
-    stream: &mut impl StreamFeed,
+    stream: &mut (impl StreamFeed + ?Sized),
     commands: &Receiver<Command>,
     yielding: &Yielding,
     deferred: &mut VecDeque<Command>,

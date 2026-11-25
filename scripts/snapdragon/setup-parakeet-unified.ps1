@@ -7,7 +7,8 @@ param(
     [int]$MelFrames = 1280,
     [ValidateRange(1, 4)]
     [int]$LayersPerStage = 2,
-    [switch]$Optimize
+    [switch]$Optimize,
+    [switch]$Streaming
 )
 
 $ErrorActionPreference = 'Stop'
@@ -97,6 +98,59 @@ function Install-Acceleration {
     }
 }
 
+function Install-Streaming {
+    param([string]$ModelPath, [string]$SourcePath, [string]$Python, [string]$ToolPath)
+
+    $destination = Join-Path $ModelPath 'streaming'
+    if (Test-Path -LiteralPath $destination) {
+        $hashes = Get-Content -LiteralPath (Join-Path $destination 'sha256.json') -Raw | ConvertFrom-Json
+        $encoder = Get-Content -LiteralPath (Join-Path $destination 'encoder-manifest.json') -Raw | ConvertFrom-Json
+        $required = @('encoder-manifest.json')
+        foreach ($stage in $encoder.stages) {
+            if ($stage -notmatch '^encoder-\d{2}\.onnx$') {
+                throw "Invalid streaming encoder stage: $stage"
+            }
+            $required += $stage, ([IO.Path]::GetFileNameWithoutExtension($stage) + '_qnn.bin')
+        }
+        foreach ($name in $required) {
+            if (-not $hashes.PSObject.Properties[$name]) {
+                throw "The streaming digest manifest is missing $name"
+            }
+        }
+        foreach ($entry in $hashes.PSObject.Properties) {
+            if ([System.IO.Path]::GetFileName($entry.Name) -ne $entry.Name) {
+                throw "Invalid streaming asset name: $($entry.Name)"
+            }
+            Assert-Sha256 (Join-Path $destination $entry.Name) $entry.Value
+        }
+        return
+    }
+
+    $build = Join-Path $ModelPath ('streaming-build-' + [guid]::NewGuid().ToString('N'))
+    $previousPythonPath = $env:PYTHONPATH
+    try {
+        $env:PYTHONPATH = $ToolPath
+        Invoke-Checked $Python @(
+            '-B', (Join-Path $PSScriptRoot 'prepare_unified_streaming.py'),
+            '--source-dir', $SourcePath, '--output-dir', $build
+        )
+        $hashes = [ordered]@{}
+        foreach ($file in Get-ChildItem -LiteralPath $build -File) {
+            $hashes[$file.Name] = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
+        }
+        $hashes | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $build 'sha256.json') -Encoding UTF8
+        [System.IO.Directory]::Move($build, $destination)
+    } finally {
+        $env:PYTHONPATH = $previousPythonPath
+        if (Test-Path -LiteralPath $build -PathType Container) {
+            $resolvedBuild = (Resolve-Path -LiteralPath $build).Path
+            if ((Split-Path -Parent $resolvedBuild) -eq $ModelPath) {
+                Remove-Item -LiteralPath $resolvedBuild -Recurse -Force
+            }
+        }
+    }
+}
+
 $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
 if ($cpu.Architecture -ne 12) {
     throw 'This setup requires Windows ARM64 on a Snapdragon PC.'
@@ -109,7 +163,8 @@ if (-not $SourceDir) { $SourceDir = Join-Path $root 'models-unified-source' }
 if (-not $ModelDir) { $ModelDir = Join-Path $root 'models-unified-qnn' }
 $ModelDir = [System.IO.Path]::GetFullPath($ModelDir)
 $verified = Join-Path $ModelDir 'sha256.json'
-if (Test-Path -LiteralPath $verified -PathType Leaf) {
+$hasModel = Test-Path -LiteralPath $verified -PathType Leaf
+if ($hasModel) {
     $hashes = Get-Content -LiteralPath $verified -Raw | ConvertFrom-Json
     $encoder = Get-Content -LiteralPath (Join-Path $ModelDir 'encoder-manifest.json') -Raw | ConvertFrom-Json
     foreach ($name in @('encoder-manifest.json', 'decoder_joint.onnx', 'decoder-joint-static.onnx', 'vocab.txt') + $encoder.stages) {
@@ -129,11 +184,13 @@ if (Test-Path -LiteralPath $verified -PathType Leaf) {
     ) {
         throw "The installed encoder uses a different build. Pass a new -ModelDir: $ModelDir"
     }
-    if ($Optimize) { Install-Acceleration $ModelDir $root }
-    Write-Output $ModelDir
-    return
+    if ($Optimize -or $Streaming) { Install-Acceleration $ModelDir $root }
+    if (-not $Streaming) {
+        Write-Output $ModelDir
+        return
+    }
 }
-if (Test-Path -LiteralPath $ModelDir) {
+if (-not $hasModel -and (Test-Path -LiteralPath $ModelDir)) {
     throw "The target directory already exists. Pass a new -ModelDir: $ModelDir"
 }
 
@@ -185,10 +242,19 @@ try {
     $downloadLock.Dispose()
 }
 
+$toolDir = Join-Path $root 'unified-converter-python'
+if ($hasModel) {
+    Invoke-Checked $uv @(
+        'pip', 'install', '--python', $python, '--target', $toolDir, '--no-cache', 'onnx==1.23.2'
+    )
+    Install-Streaming $ModelDir $source $python $toolDir
+    Write-Output $ModelDir
+    return
+}
+
 $parent = (New-Item -Path (Split-Path -Parent $ModelDir) -ItemType Directory -Force).FullName
 $stage = Join-Path $parent ('unified-build-' + [guid]::NewGuid().ToString('N'))
 New-Item -Path $stage -ItemType Directory | Out-Null
-$toolDir = Join-Path $root 'unified-converter-python'
 $previousPythonPath = $env:PYTHONPATH
 try {
     Invoke-Checked $uv @(
@@ -212,7 +278,8 @@ try {
         $hashes[$file.Name] = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
     }
     $hashes | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $stage 'sha256.json') -Encoding UTF8
-    if ($Optimize) { Install-Acceleration $stage $root }
+    if ($Optimize -or $Streaming) { Install-Acceleration $stage $root }
+    if ($Streaming) { Install-Streaming $stage $source $python $toolDir }
     [System.IO.Directory]::Move($stage, $ModelDir)
     Write-Output $ModelDir
 } finally {

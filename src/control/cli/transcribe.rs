@@ -107,11 +107,13 @@ fn transcribe_snapdragon(file: &Path, model: Option<&str>, language: Option<&str
         Ok(pieces) => pieces,
         Err(reply) => return reply,
     };
-    let mut worker =
-        match snapdragon::Qnn::load(&language.map_or_else(snapdragon::language, str::to_owned)) {
-            Ok(worker) => worker,
-            Err(error) => return ControlReply::error("model-unavailable", format!("{error:#}")),
-        };
+    let mut worker = match snapdragon::Qnn::load(
+        &language.map_or_else(snapdragon::language, str::to_owned),
+        false,
+    ) {
+        Ok(worker) => worker,
+        Err(error) => return ControlReply::error("model-unavailable", format!("{error:#}")),
+    };
     if let Some(model) = model
         && model != worker.identity().model
     {

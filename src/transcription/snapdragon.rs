@@ -1,11 +1,11 @@
-//! The opt-in Windows ARM64 Whisper worker, using a private stdio pipe.
+//! The opt-in Windows ARM64 QNN worker, using a private stdio pipe.
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::process::{Child, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::time::{Duration, Instant};
 
 use color_eyre::eyre::{Result, WrapErr, bail, eyre};
@@ -27,6 +27,8 @@ const LANGUAGE_ENV: &str = "HEX_SNAPDRAGON_LANGUAGE";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const CLIP_TIMEOUT: Duration = Duration::from_secs(90);
+const STREAM_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_STREAM_PUSH: usize = 16_000;
 const MAX_REPLY: u64 = 1024 * 1024;
 const MAX_FRAMES: usize = 30 * 16_000;
 
@@ -61,14 +63,15 @@ pub(crate) struct Qnn {
     worker: Option<Worker>,
     identity: Identity,
     backend: SpeechBackend,
+    streaming: bool,
     detected_language: Option<String>,
 }
 
 impl Qnn {
-    pub(crate) fn load(language: &str) -> Result<Self> {
+    pub(crate) fn load(language: &str, streaming: bool) -> Result<Self> {
         let config = Config::read()?;
         let mut worker = Worker::start(&config)?;
-        let ready = worker.initialize()?;
+        let ready = worker.initialize(streaming)?;
         let language = ready.language(language)?;
         tracing::info!(
             model = ready.model,
@@ -90,6 +93,7 @@ impl Qnn {
                 device: "Qualcomm Hexagon NPU (HTP)".into(),
                 crash_fallback: false,
             },
+            streaming: ready.streaming,
             detected_language: None,
         })
     }
@@ -104,6 +108,83 @@ impl Qnn {
 
     pub(crate) fn detected_language(&self) -> Option<&str> {
         self.detected_language.as_deref()
+    }
+
+    pub(crate) fn supports_streaming(&self) -> bool {
+        self.streaming
+    }
+
+    pub(crate) fn stream_start(&mut self) -> Result<()> {
+        if !self.streaming {
+            bail!("the Snapdragon speech model takes finished audio clips");
+        }
+        self.detected_language = None;
+        let language =
+            (self.identity.language != AUTO_LANGUAGE).then(|| self.identity.language.clone());
+        self.stream_request::<serde_json::Value>(
+            Request::StreamStart {
+                language: language.as_deref(),
+            },
+            &[],
+            STARTUP_TIMEOUT,
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn stream_push(&mut self, samples: &[f32]) -> Result<String> {
+        let mut text = String::new();
+        let mut pcm = Vec::with_capacity(samples.len().min(MAX_STREAM_PUSH) * 2);
+        for chunk in samples.chunks(MAX_STREAM_PUSH) {
+            pcm.clear();
+            pcm.extend(
+                chunk
+                    .iter()
+                    .flat_map(|&sample| pcm_sample(sample).to_le_bytes()),
+            );
+            let clip = self.stream_request::<Clip>(
+                Request::StreamPush {
+                    sample_count: chunk.len(),
+                },
+                &pcm,
+                STREAM_TIMEOUT,
+            )?;
+            text = clip.text;
+        }
+        Ok(text)
+    }
+
+    pub(crate) fn stream_finish(&mut self) -> Result<String> {
+        let clip = self.stream_request::<Clip>(Request::StreamFinish, &[], STREAM_TIMEOUT)?;
+        self.detected_language = clip.language.filter(|_| !clip.text.trim().is_empty());
+        Ok(clip.text)
+    }
+
+    pub(crate) fn stream_cancel(&mut self) {
+        if let Some(worker) = &mut self.worker
+            && worker
+                .request_pcm::<serde_json::Value>(Request::StreamCancel, &[], STREAM_TIMEOUT, false)
+                .is_err()
+        {
+            self.worker.take();
+        }
+    }
+
+    fn stream_request<T: serde::de::DeserializeOwned>(
+        &mut self,
+        request: Request<'_>,
+        pcm: &[u8],
+        timeout: Duration,
+    ) -> Result<T> {
+        self.ensure_worker()?;
+        let result = self
+            .worker
+            .as_mut()
+            .expect("initialized worker")
+            .request_pcm(request, pcm, timeout, true);
+        if result.is_err() {
+            self.worker.take();
+        }
+        result
     }
 
     pub(crate) fn transcribe(&mut self, samples: &[f32]) -> Result<Transcript> {
@@ -162,8 +243,8 @@ impl Qnn {
     fn ensure_worker(&mut self) -> Result<()> {
         if self.worker.is_none() {
             let mut worker = Worker::start(&self.config)?;
-            let ready = worker.initialize()?;
-            if ready.model != self.identity.model {
+            let ready = worker.initialize(self.streaming)?;
+            if ready.model != self.identity.model || ready.streaming != self.streaming {
                 bail!("the Snapdragon worker loaded a different model; restart Hex to use it");
             }
             ready.language(&self.identity.language)?;
@@ -212,6 +293,8 @@ struct Ready {
     provider: String,
     cpu_fallback: bool,
     languages: Vec<String>,
+    #[serde(default)]
+    streaming: bool,
 }
 
 impl Ready {
@@ -254,11 +337,21 @@ struct Segment {
 #[derive(Serialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 enum Request<'a> {
-    Initialize,
+    Initialize {
+        streaming: bool,
+    },
     Transcribe {
         audio_path: &'a Path,
         language: Option<&'a str>,
     },
+    StreamStart {
+        language: Option<&'a str>,
+    },
+    StreamPush {
+        sample_count: usize,
+    },
+    StreamFinish,
+    StreamCancel,
 }
 
 #[derive(Serialize)]
@@ -278,7 +371,7 @@ struct Reply<T> {
 struct Worker {
     child: Child,
     _job: OwnedHandle,
-    input: Option<ChildStdin>,
+    input: Option<SyncSender<Vec<u8>>>,
     replies: Receiver<io::Result<Vec<u8>>>,
     id: u64,
 }
@@ -302,9 +395,21 @@ impl Worker {
             let _ = child.wait();
             return Err(error).wrap_err("could not manage the Snapdragon worker process");
         }
-        let input = child.stdin.take().expect("worker stdin pipe");
+        let mut stdin = child.stdin.take().expect("worker stdin pipe");
         let mut output = BufReader::new(child.stdout.take().expect("worker stdout pipe"));
         let (send, replies) = mpsc::sync_channel(1);
+        let (input, packets) = mpsc::sync_channel::<Vec<u8>>(1);
+        let write_errors = send.clone();
+        std::thread::Builder::new()
+            .name("snapdragon-worker-input".into())
+            .spawn(move || {
+                for packet in packets {
+                    if let Err(error) = stdin.write_all(&packet).and_then(|_| stdin.flush()) {
+                        let _ = write_errors.try_send(Err(error));
+                        break;
+                    }
+                }
+            })?;
         std::thread::Builder::new()
             .name("snapdragon-worker-output".into())
             .spawn(move || {
@@ -341,8 +446,8 @@ impl Worker {
         })
     }
 
-    fn initialize(&mut self) -> Result<Ready> {
-        let ready: Ready = self.request(Request::Initialize, STARTUP_TIMEOUT)?;
+    fn initialize(&mut self, streaming: bool) -> Result<Ready> {
+        let ready: Ready = self.request(Request::Initialize { streaming }, STARTUP_TIMEOUT)?;
         if ready.backend != "qnn"
             || ready.device != "htp"
             || ready.provider != "QNNExecutionProvider"
@@ -360,17 +465,33 @@ impl Worker {
         request: Request<'_>,
         timeout: Duration,
     ) -> Result<T> {
+        self.request_pcm(request, &[], timeout, true)
+    }
+
+    fn request_pcm<T: serde::de::DeserializeOwned>(
+        &mut self,
+        request: Request<'_>,
+        pcm: &[u8],
+        timeout: Duration,
+        cancellable: bool,
+    ) -> Result<T> {
+        let cancel = cancellable.then(job_cancel).flatten();
+        if cancel.as_ref().is_some_and(|cancel| cancel.is_cancelled()) {
+            bail!("Snapdragon transcription was cancelled");
+        }
+        let deadline = Instant::now() + timeout;
         self.id += 1;
-        let request = Message {
+        let mut packet = serde_json::to_vec(&Message {
             id: self.id,
             request,
-        };
-        let input = self.input.as_mut().expect("open worker stdin");
-        serde_json::to_writer(&mut *input, &request)?;
-        input.write_all(b"\n")?;
-        input.flush()?;
-        let cancel = job_cancel();
-        let deadline = Instant::now() + timeout;
+        })?;
+        packet.push(b'\n');
+        packet.extend_from_slice(pcm);
+        self.input
+            .as_ref()
+            .expect("open worker stdin")
+            .try_send(packet)
+            .map_err(|error| eyre!("could not queue a Snapdragon worker request: {error}"))?;
         let line = loop {
             if cancel.as_ref().is_some_and(|cancel| cancel.is_cancelled()) {
                 bail!("Snapdragon transcription was cancelled");
@@ -469,11 +590,15 @@ impl AudioFile {
             },
         )?;
         for sample in samples {
-            wav.write_sample((sample * 32_768.0).round() as i16)?;
+            wav.write_sample(pcm_sample(*sample))?;
         }
         wav.finalize()?;
         Ok(audio)
     }
+}
+
+fn pcm_sample(sample: f32) -> i16 {
+    (sample * 32_768.0).round() as i16
 }
 
 impl Drop for AudioFile {

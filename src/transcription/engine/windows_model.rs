@@ -2,7 +2,9 @@
 
 use color_eyre::eyre::Result;
 
+use super::{CancelToken, Partial, StreamFeed};
 use crate::transcription::SpeechBackend;
+use crate::transcription::gguf_session::with_job_cancel;
 use crate::transcription::local_transcriber::{LocalTranscriber, TimedSpan};
 use crate::transcription::models::{TranscriptionModelId, TranscriptionSelection};
 use crate::transcription::snapdragon::{Identity, Qnn};
@@ -64,10 +66,10 @@ impl Model {
         }
     }
 
-    pub(super) fn stream_options(&self) -> Option<&transcribe_cpp::StreamOptions> {
+    pub(super) fn supports_streaming(&self) -> bool {
         match self {
-            Self::Gguf(model) => model.stream_options(),
-            Self::Snapdragon(_) => None,
+            Self::Gguf(model) => model.stream_options().is_some(),
+            Self::Snapdragon(model) => model.supports_streaming(),
         }
     }
 
@@ -98,15 +100,33 @@ impl Model {
 
     pub(super) fn with_stream<R>(
         &mut self,
-        stream_options: &transcribe_cpp::StreamOptions,
-        cancel: &transcribe_cpp::CancelToken,
-        drive: impl FnOnce(&mut transcribe_cpp::Stream<'_>) -> R,
-    ) -> transcribe_cpp::Result<R> {
-        match self.gguf() {
-            Some(model) => model.with_stream(stream_options, cancel, drive),
-            None => Err(transcribe_cpp::Error::NotImplemented(
-                "the Snapdragon worker takes finished audio clips".into(),
-            )),
+        cancel: &CancelToken,
+        drive: impl FnOnce(&mut dyn StreamFeed) -> R,
+    ) -> Result<R, String> {
+        match self {
+            Self::Gguf(model) => {
+                let options = model
+                    .stream_options()
+                    .cloned()
+                    .ok_or("the speech model cannot stream on its device")?;
+                model
+                    .with_stream(&options, cancel, |stream| drive(stream))
+                    .map_err(|error| error.to_string())
+            }
+            Self::Snapdragon(model) => {
+                if cancel.is_cancelled() {
+                    return Err("Snapdragon streaming was cancelled".into());
+                }
+                with_job_cancel(cancel, || model.stream_start())
+                    .map_err(|error| error.to_string())?;
+                let mut stream = SnapdragonStream {
+                    model,
+                    cancel,
+                    tentative: String::new(),
+                    open: true,
+                };
+                Ok(drive(&mut stream))
+            }
         }
     }
 
@@ -129,6 +149,47 @@ impl Model {
                     .collect();
                 Ok((result.text, segments))
             }
+        }
+    }
+}
+
+/// A stream owns the worker-side capture until it finishes or is dropped.
+struct SnapdragonStream<'a> {
+    model: &'a mut Qnn,
+    cancel: &'a CancelToken,
+    tentative: String,
+    open: bool,
+}
+
+impl StreamFeed for SnapdragonStream<'_> {
+    fn feed(&mut self, samples: &[f32]) -> Result<(), String> {
+        if !samples.is_empty() {
+            self.tentative = with_job_cancel(self.cancel, || self.model.stream_push(samples))
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    fn finalize(&mut self) -> Result<String, String> {
+        let text = with_job_cancel(self.cancel, || self.model.stream_finish())
+            .map_err(|error| error.to_string())?;
+        self.open = false;
+        let text = text.trim().to_string();
+        Ok(crate::transcription::subtitle_credits::strip(&text).map_or(text, |(kept, _)| kept))
+    }
+
+    fn partial(&self) -> Partial {
+        Partial {
+            stable: String::new(),
+            tentative: self.tentative.clone(),
+        }
+    }
+}
+
+impl Drop for SnapdragonStream<'_> {
+    fn drop(&mut self) {
+        if self.open {
+            self.model.stream_cancel();
         }
     }
 }

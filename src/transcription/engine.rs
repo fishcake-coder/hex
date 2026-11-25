@@ -35,6 +35,38 @@ mod windows_model;
 #[cfg(target_os = "windows")]
 pub(crate) use windows_model::Model;
 
+fn model_can_stream(model: &Model) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        model.supports_streaming()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        model.stream_options().is_some()
+    }
+}
+
+fn with_model_stream<R>(
+    model: &mut Model,
+    cancel: &CancelToken,
+    drive: impl FnOnce(&mut dyn StreamFeed) -> R,
+) -> Result<R, String> {
+    #[cfg(target_os = "windows")]
+    {
+        model.with_stream(cancel, drive)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let options = model
+            .stream_options()
+            .cloned()
+            .ok_or("the speech model cannot stream on its device")?;
+        model
+            .with_stream(&options, cancel, |stream| drive(stream))
+            .map_err(|error| error.to_string())
+    }
+}
+
 /// Transcribes a complete 16 kHz clip offline on the engine thread.
 pub(crate) type Offline = Box<dyn FnOnce(&mut Model, Vec<f32>) -> Result<String, String> + Send>;
 
@@ -311,6 +343,7 @@ impl YieldingStream {
 impl Drop for YieldingStream {
     fn drop(&mut self) {
         if !self.finished {
+            self.cancel.cancel();
             let _ = self.commands.send(Command::Cancel { stream: self.id });
         }
     }
@@ -474,6 +507,7 @@ impl LiveStream {
 impl Drop for LiveStream {
     fn drop(&mut self) {
         if !self.finished {
+            self.cancel.cancel();
             let _ = self.commands.send(Command::Cancel { stream: self.id });
         }
     }
@@ -553,7 +587,7 @@ impl PendingTranscript {
 
 impl TranscriptionEngine {
     pub fn start(model: Model) -> Result<Self> {
-        let streams = model.stream_options().is_some();
+        let streams = model_can_stream(&model);
         Self::with_model(Some(model), None, streams)
     }
 
@@ -1263,7 +1297,7 @@ impl Worker {
     fn publish_streams(&self) {
         if let Some(model) = &self.model {
             self.streams
-                .store(model.stream_options().is_some(), Ordering::Release);
+                .store(model_can_stream(model), Ordering::Release);
         }
     }
 
@@ -1323,10 +1357,7 @@ impl Worker {
         commands: &Receiver<Command>,
         next: &mut VecDeque<Command>,
     ) {
-        let options = self
-            .model()
-            .and_then(|model| model.stream_options().cloned());
-        let Some(options) = options else {
+        if !self.model().is_some_and(|model| model_can_stream(model)) {
             let loaded = self.model.is_some();
             let model_streams = self
                 .model
@@ -1355,7 +1386,7 @@ impl Worker {
                 ),
             }
             return;
-        };
+        }
         self.running.enter(cancel);
         let begun = Instant::now();
         let mut stats = FeedStats::default();
@@ -1366,7 +1397,7 @@ impl Worker {
         let trailing_silence = stream_trailing_silence(model);
         let closing_mark = stream_requires_closing_mark(model);
         let opening_slack = stream_opening_slack(model);
-        let ended = model.with_stream(&options, cancel, |stream| {
+        let ended = with_model_stream(model, cancel, |stream| {
             let mut capped = PauseCap::new(stream, trailing_silence)
                 .ignoring_head(head_ignored)
                 .opening_slack(opening_slack);
@@ -1411,7 +1442,7 @@ impl Worker {
                     Ok(text) => job.finish(Ok(Transcribed {
                         text,
                         #[cfg(target_os = "windows")]
-                        language: None,
+                        language: model.detected_language().map(str::to_owned),
                         source: Source::Stream,
                         finish_ms: started.elapsed().as_millis() as u64,
                     })),
@@ -1451,17 +1482,14 @@ impl Worker {
         if cancel.is_cancelled() {
             return;
         }
-        let options = self
-            .model()
-            .and_then(|model| model.stream_options().cloned());
-        let Some(options) = options else {
+        if !self.model().is_some_and(|model| model_can_stream(model)) {
             return;
-        };
+        }
         self.running.enter(cancel);
         let Some(model) = self.model.as_mut() else {
             return;
         };
-        let ended = model.with_stream(&options, cancel, |stream| {
+        let ended = with_model_stream(model, cancel, |stream| {
             drive_yielding(id, stream, commands, yielding, next)
         });
         match ended {

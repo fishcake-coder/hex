@@ -73,13 +73,46 @@ model. General displays the active model and language setting.
 The configured app keeps the worker warm while listening. Start standard Hex
 to use its catalog and automatic model switching.
 
-The listener and file command send short-lived mono 16 kHz WAVs over a
-private local handoff. Hex removes each WAV when the request finishes.
+Whole-clip dictation and the file command send short-lived mono 16 kHz WAVs
+over a private local handoff. Hex removes each WAV when the request finishes.
 An abrupt process kill can leave a `hex-snapdragon-*.wav` in the user's
 temporary directory. Long clips cut near a quiet point to fit the model window.
 The configured process skips Hex's optional Silero detector.
 The ordinary low-level silence and short-tap checks still apply to dictation.
-QNN works on finished audio, so streaming live text is unavailable.
+
+## Parakeet Unified Live Text
+
+Quit Hex before updating an existing build. Build the native binaries from
+this branch, run Unified setup with `-Streaming`, and reinstall the launcher.
+The worker detects the compiled streaming encoder alongside the Unified model.
+Turn on **Live text** in Hex's Labs to display provisional words beside the
+dictation indicator.
+
+```powershell
+& '.\scripts\build-snapdragon.ps1'
+& '.\scripts\snapdragon\setup-parakeet-unified.ps1' -Streaming
+& '.\scripts\snapdragon\install-launcher.ps1'
+```
+
+Hex sends incremental 16 kHz PCM through the local worker pipe. The buffered
+encoder runs on QNN with 5.6 seconds of left context,
+560 ms chunks, and 560 ms of lookahead. The decoder carries its recurrent
+state between chunks. Releasing the shortcut flushes the last words and
+continues through the usual output and paste flow. Hex can transcribe the
+recorded clip offline if it cannot use the streaming result. Set
+`HEX_STREAMING=0` before launch to use the whole-clip path.
+
+On the Snapdragon X Plus X1P42100, the 560 ms configuration showed
+provisional text before release on 102 of 108 recorded English clips. The
+median first preview followed 1.76 seconds of audio. The median worker
+finish took 105 ms after the last input, with 9.24% word error rate across
+the same recordings used for the whole-clip comparison below.
+
+A 320 ms experiment showed text after a median 1.28 seconds of audio. The
+560 ms configuration used 68 seconds of worker CPU time across the corpus,
+compared with 119 seconds at 320 ms. It also had slightly lower word error
+rate. These timings cover recorded audio replay and exclude microphone
+capture, app startup, and pasting.
 
 On an existing Unified installation, run
 `scripts/snapdragon/setup-parakeet-unified.ps1 -Optimize`, then rerun
