@@ -278,7 +278,7 @@ struct CallbackState {
     cancel: Option<WindowsHotkey>,
     cancel_vk: Option<u32>,
     /// The cancel key went down while Hex held it; its release is ours too.
-    cancel_down: bool,
+    cancel_down: Option<u32>,
     modifiers: ModifierState,
     /// The same read with AltGr's synthesized Left Ctrl still counted, which
     /// a binding with a key has always seen (`ModifierState::holds`).
@@ -304,6 +304,7 @@ struct CaptureState {
     locked: bool,
     second_tap: bool,
     recording: bool,
+    inline_escape: bool,
     last_release_ms: Option<u32>,
     /// When the held press that records began, from the hook's tick count:
     /// a key joining it a second or more later is the app's (Labs › Hold
@@ -350,6 +351,7 @@ impl CaptureState {
             return None;
         }
         self.active = true;
+        self.inline_escape = false;
         let double_tapped = self
             .last_release_ms
             .take()
@@ -620,7 +622,7 @@ impl WindowsHotkeyMonitor {
             drawing_escape_down: false,
             cancel,
             cancel_vk,
-            cancel_down: false,
+            cancel_down: None,
             modifiers: ModifierState::default(),
             raw_modifiers: ModifierState::default(),
             side_down: SideDownTimes::default(),
@@ -1062,26 +1064,26 @@ fn process_button(
                 }
                 return Handled::own(Disposition::Suppress);
             }
-            // Toggle's cancel key discards the recording. Hex takes it only
-            // while a toggled capture records, and keeps its repeats and
-            // release, so the app in front never acts on it.
-            let cancel_event = state.cancel_vk == Some(vk)
-                && (state.cancel_down
-                    || (is_down
-                        && state.capture.wants_cancel()
-                        && state
-                            .cancel
-                            .as_ref()
-                            .is_some_and(|binding| state.holds(binding))));
-            if cancel_event {
-                if is_down && !state.cancel_down {
-                    state.cancel_down = true;
+            // Escape also cancels a hold when inline dictation has started.
+            // Keep a captured cancel key's repeats and release with Hex.
+            let inline_escape = vk == u32::from(VK_ESCAPE)
+                && state.capture.inline_escape
+                && state.capture.recording;
+            let toggle_cancel = state.cancel_vk == Some(vk)
+                && state.capture.wants_cancel()
+                && state
+                    .cancel
+                    .as_ref()
+                    .is_some_and(|binding| state.holds(binding));
+            if state.cancel_down == Some(vk) || (is_down && (inline_escape || toggle_cancel)) {
+                if is_down && state.cancel_down != Some(vk) {
+                    state.cancel_down = Some(vk);
                     if let Some(action) = state.capture.cancel() {
                         watchdog::note_cancelled();
                         send_event(state, action, time);
                     }
                 } else if is_up {
-                    state.cancel_down = false;
+                    state.cancel_down = None;
                 }
                 return Handled::own(Disposition::Suppress);
             }
@@ -1534,7 +1536,7 @@ mod tests {
             drawing_escape_down: false,
             cancel: None,
             cancel_vk: None,
-            cancel_down: false,
+            cancel_down: None,
             modifiers: ModifierState::default(),
             raw_modifiers: ModifierState::default(),
             side_down: SideDownTimes::default(),

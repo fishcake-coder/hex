@@ -582,8 +582,16 @@ fn rows(ui: &Ui) -> Vec<Row> {
     rows.push(row(Feature::FasterLiveText, None));
     rows.push(row(Feature::FailureNotices, None));
     rows.push(row(Feature::StopPhrase, None));
-    if caps.os == super::platform::Os::Linux && ui.platform.wayland {
-        let live_typing = row(Feature::LiveTyping, Some(&KEYBOARD));
+    if caps.os == super::platform::Os::Windows {
+        rows.push(Row {
+            note: Some(tr("Requires the Hex Live Typing Windows input service").to_owned()),
+            ..row(Feature::LiveTyping, Some(&KEYBOARD))
+        });
+    } else if caps.os == super::platform::Os::Linux && ui.platform.wayland {
+        let live_typing = Row {
+            about: tr("On Wayland, show your words in the text box as you speak, then Hex types the text there").into(),
+            ..row(Feature::LiveTyping, Some(&KEYBOARD))
+        };
         // An organization's lock and its note already say why the switch is
         // off; the desktop's own limit only replaces an unlocked card.
         if Feature::LiveTyping.managed().is_some() {

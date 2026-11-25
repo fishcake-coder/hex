@@ -254,8 +254,8 @@ impl Feature {
             | Self::TypedText
             | Self::GnomeMeetingCapsules
             | Self::GnomeAnnotate
-            | Self::AnnotatePointerScreen
-            | Self::LiveTyping => LINUX,
+            | Self::AnnotatePointerScreen => LINUX,
+            Self::LiveTyping => WINDOWS_LINUX,
             Self::StandaloneSpecialKeys | Self::SkipPauses | Self::TerminalPasteShortcut => {
                 WINDOWS_LINUX
             }

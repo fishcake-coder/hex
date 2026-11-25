@@ -45,6 +45,16 @@ impl CaptureState {
 }
 
 impl WindowsHotkeyMonitor {
+    /// Let Escape cancel a physical hold that started an inline composition.
+    pub(crate) fn allow_inline_escape(&self) {
+        let mut guard = CALLBACK_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(state) = guard.as_mut()
+            && state.capture.recording
+        {
+            state.capture.inline_escape = true;
+        }
+    }
+
     /// Adopt a command the listener accepted, without generating another
     /// shortcut event. Physical input then finishes/cancels the same capture.
     pub(crate) fn command_capture(&self, recording: Option<DictationFlavour>) {

@@ -1199,7 +1199,24 @@ Output shows a note pointing to it. Checks:
 `gnome_desktops_point_to_the_clipboard_lab_until_it_is_on` (constructed state;
 not run on GNOME).
 
-### Live Typing (Labs, Linux Wayland)
+### Live Typing (Labs)
+
+On Windows, enable **Live typing** with the Hex Live Typing text service
+available in the focused app. A physical dictation shortcut opens a text
+composition in a compatible field. It receives the latest provisional
+transcript as recognition progresses. Releasing the shortcut commits
+the processed result once. Escape cancels the recording and clears its
+preview. Focus changes and abandoned output also end the composition.
+If the field changes before commit, Hex can put
+the result on the clipboard for manual paste. A field without a text
+service uses the standard Windows paste path.
+
+The Windows listener hands changed previews to an event-driven worker
+with one pending preview. That worker sends the text to the target app's
+own Windows text service while audio capture continues on the listener.
+The encoder and decoder stay on the selected speech device.
+
+#### Linux Wayland
 
 ```ts
 Labs › Live typing on (labs.live_typing, off by default, Wayland only)  // labs.live-typing

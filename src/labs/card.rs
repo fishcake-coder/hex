@@ -107,7 +107,7 @@ impl Feature {
                 "When a dictation fails, show the reason next to the small recording indicator (Dictation HUD)"
             }
             Self::LiveTyping => {
-                "On Wayland, show your words in the text box as you speak, then Hex types the text there"
+                "Show your words in a compatible text box as you speak and insert the finished dictation there"
             }
             Self::LiveChapters => "Split a meeting's text into chapters while it records",
             Self::ScreenVocabulary => {

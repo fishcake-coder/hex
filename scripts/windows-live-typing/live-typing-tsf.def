@@ -1,0 +1,4 @@
+LIBRARY HexLiveTypingTsf
+EXPORTS
+    DllCanUnloadNow PRIVATE
+    DllGetClassObject PRIVATE

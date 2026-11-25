@@ -10,7 +10,7 @@ use crate::control::PrintedTranscript;
 use crate::dictation::paste_last::LastDictation;
 use crate::windows::paste::{Paste, WindowsPaster};
 
-use super::{Job, JobResult, OutputKind};
+use super::{Job, JobResult, OutputKind, live_typing::Commit};
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn process_dictation_job(
@@ -112,9 +112,19 @@ pub(super) fn process_dictation_job(
             // A dictation YOLO mode sends is pasted anyway.
             let copy_only = crate::labs::copy_only() && !sends;
             let pasted = if copy_only {
+                job.inline.take();
                 paster.copy_only(&text).map(|()| Paste::Copied)
             } else {
-                paster.paste(&text, job.flavour.terminal_paste(), job.return_to, signed)
+                match job.inline.take().map(|inline| inline.finish(&text)) {
+                    Some(Commit::Inserted) => Ok(Paste::Sent),
+                    Some(Commit::Copy) => paster.copy_only(&text).map(|()| Paste::Copied),
+                    Some(Commit::Uncertain) => Err(color_eyre::eyre::eyre!(
+                        "the text service did not confirm the inline commit"
+                    )),
+                    Some(Commit::Paste) | None => {
+                        paster.paste(&text, job.flavour.terminal_paste(), job.return_to, signed)
+                    }
+                }
             };
             sent = matches!(pasted, Ok(Paste::Sent)) && sends;
             let pasted = if sent {

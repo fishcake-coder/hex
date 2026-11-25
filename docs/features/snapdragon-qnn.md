@@ -135,6 +135,32 @@ an error. Separate local API requests that explicitly select a catalog model
 still use that catalog model. The standalone file command opens its own worker
 and can consume NPU memory alongside the listener.
 
+## Typing inside the focused field
+
+Windows **Live typing** uses a native Windows Text Services Framework
+speech profile. Build the native text service, run its `Register` action
+from an elevated PowerShell, then run `Enable` from your regular user
+session. Enable **Live typing** in Hex's Labs. Registration installs the
+text service under Program Files. The speech profile is separate from
+the keyboard profile.
+
+```powershell
+& '.\scripts\windows-live-typing\build.ps1'
+# Run Register from an Administrator PowerShell in the same checkout.
+& '.\scripts\windows-live-typing\install.ps1' -Action Register
+# Run Enable from your ordinary PowerShell.
+& '.\scripts\windows-live-typing\install.ps1' -Action Enable
+& '.\Hex Snapdragon.cmd' labs on live-typing
+```
+
+A supported focused field displays the provisional transcript while the
+same Snapdragon worker runs recognition. Release commits the processed
+dictation once. Cancel clears the composition. The Windows service
+manages these edits and never receives the microphone audio. Use
+`-Action Disable` from your regular user session to deactivate the speech
+profile and `-Action Unregister` from an elevated PowerShell to remove its
+registration.
+
 ## Local verification
 
 Across two replay rounds of the same 108 English recordings, the installed

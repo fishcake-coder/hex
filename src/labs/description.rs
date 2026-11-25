@@ -22,6 +22,11 @@ impl Feature {
             Self::FailureNotices => {
                 "When a dictation fails, show the reason next to the small recording indicator (Dictation HUD)"
             }
+            #[cfg(target_os = "windows")]
+            Self::LiveTyping => {
+                "Show your words in supported text boxes as you speak (requires the Hex Live Typing text service)"
+            }
+            #[cfg(not(target_os = "windows"))]
             Self::LiveTyping => {
                 "On Wayland, show your words in the text box as you speak, then Hex types the text there"
             }

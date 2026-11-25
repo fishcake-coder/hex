@@ -24,10 +24,12 @@ use crate::windows::input::{HotkeyAction, WindowsHotkeyMonitor};
 use crate::windows::paste::WindowsPaster;
 
 mod finish;
+mod live_typing;
 mod output;
 mod shortcuts;
 
 use finish::submit_capture;
+use live_typing::LiveTyping;
 use output::{process_dictation_job, process_paste_last};
 use shortcuts::{Shortcuts, next_action};
 
@@ -79,6 +81,7 @@ struct Job {
     /// The window in front when the capture started, where a paste returns
     /// when the desktop or a taskbar is in front instead.
     return_to: Option<crate::windows::paste::CaptureWindow>,
+    inline: Option<LiveTyping>,
 }
 
 /// A release whose capture is still collecting its post-release tail.
@@ -93,6 +96,7 @@ struct Finishing {
     stop_phrase: Option<String>,
     /// The window in front when the capture started.
     return_to: Option<crate::windows::paste::CaptureWindow>,
+    inline: Option<LiveTyping>,
 }
 
 enum OutputJob {
@@ -373,6 +377,8 @@ pub fn run(
     // The window in front when this capture started, where its paste returns
     // if the desktop or a taskbar is in front instead.
     let mut recording_return_to = None;
+    let mut recording_inline = None::<LiveTyping>;
+    let mut tried_live_typing = false;
     let mut recording_feedback_started = false;
     // Whether this capture's start tone already played on its press.
     let mut start_tone_played = false;
@@ -574,6 +580,7 @@ pub fn run(
                 by_shortcut,
                 stop_phrase,
                 return_to,
+                inline,
             }) = finishing.take()
             else {
                 unreachable!("checked above");
@@ -592,6 +599,7 @@ pub fn run(
                 context,
                 stop_phrase,
                 return_to,
+                inline,
             )?;
             if submitted {
                 next_job_id += 1;
@@ -732,6 +740,8 @@ pub fn run(
                 // microphone's does. A failed stream keeps its backoff, but
                 // the press asks for the microphone now.
                 HotkeyAction::Start if !recording && !start_pending => {
+                    recording_inline.take();
+                    tried_live_typing = false;
                     recording_flavour = flavour;
                     recording_by_shortcut = !deliberate;
                     // The window in front now, where a paste returns if the
@@ -828,14 +838,23 @@ pub fn run(
                     // after it, so the live stream must hear no further; the
                     // engine refuses a stream fed well past the clip.
                     capture.limit_stream_to(occurred_at, POST_RELEASE_TAIL);
+                    let print = print.take();
+                    let mut inline = recording_inline.take();
+                    if print.is_some() {
+                        inline = None;
+                    }
+                    if let Some(inline) = inline.as_mut() {
+                        inline.release();
+                    }
                     finishing = Some(Finishing {
                         flavour: recording_flavour,
                         by_shortcut: recording_by_shortcut,
-                        print: print.take(),
+                        print,
                         // Labs › Stop phrase: the phrase's own finish carries
                         // its words, which the job removes.
                         stop_phrase: finish_phrase,
                         return_to: recording_return_to,
+                        inline,
                         context: if capture.would_transcribe(occurred_at) {
                             crate::windows::context::begin_capture(
                                 !recording_flavour.raw()
@@ -862,6 +881,7 @@ pub fn run(
                     recording = false;
                     recording_feedback_started = false;
                     capture.cancel();
+                    recording_inline.take();
                     if let Some(indicator) = &indicator {
                         indicator.send(crate::rune_hud::HudEvent::Cancelled);
                     }
@@ -1076,17 +1096,33 @@ pub fn run(
                     // Short taps and shortcut chords never reach the model;
                     // the stream starts with the backlog once the hold counts.
                     if recording_feedback_started {
+                        if !tried_live_typing {
+                            tried_live_typing = true;
+                            if recording_by_shortcut
+                                && crate::labs::live_typing()
+                                && !crate::labs::copy_only()
+                                && !recording_flavour.terminal_paste()
+                            {
+                                recording_inline = LiveTyping::begin();
+                                if recording_inline.is_some() {
+                                    hotkey.allow_inline_escape();
+                                }
+                            }
+                        }
                         capture.begin_stream(&engine);
                     }
-                    if let Some(partial) = capture.report_live_text()
-                        && crate::labs::stop_phrase()
-                    {
+                    if let Some(partial) = capture.report_live_text() {
+                        if let Some(inline) = &recording_inline {
+                            inline.preview(&partial);
+                        }
                         // Labs › Stop phrase: a phrase the model committed, or
                         // words read twice in a row, end a hands-free capture
                         // as its shortcut's press would.
-                        let phrase = crate::labs::stop_phrase_text();
-                        if stop_phrase.observe(&partial.stable, &partial.tentative, &phrase) {
-                            hotkey.finish_hands_free(phrase);
+                        if crate::labs::stop_phrase() {
+                            let phrase = crate::labs::stop_phrase_text();
+                            if stop_phrase.observe(&partial.stable, &partial.tentative, &phrase) {
+                                hotkey.finish_hands_free(phrase);
+                            }
                         }
                     }
                 }
@@ -1137,6 +1173,7 @@ pub fn run(
                         recording_feedback_started = false;
                         recording = false;
                         capture.cancel();
+                        recording_inline.take();
                         hotkey.command_capture(None);
                         events.dictation(DictationPhase::Cancelled, "")?;
                         if let Some(indicator) = &indicator {
