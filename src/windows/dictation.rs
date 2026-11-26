@@ -1264,6 +1264,7 @@ pub fn run(
         }
     }
 
+    drop(recording_inline.take());
     if recording || finishing.is_some() {
         capture.cancel();
         events.dictation(DictationPhase::Cancelled, "")?;

@@ -3,6 +3,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{HWND, POINT};
@@ -25,6 +26,7 @@ const COMMIT: usize = 3;
 const CANCEL: usize = 4;
 const PROBE: usize = 5;
 const ACCEPT: usize = 6;
+const BEGIN_OWNED: usize = 7;
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(240);
 const SELECTION_RECHECK: Duration = Duration::from_millis(120);
 const INPUT_SETTLE: Duration = Duration::from_millis(120);
@@ -97,6 +99,9 @@ enum Response {
 fn send(window: isize, capture: u64, operation: usize, text: &str) -> Response {
     let mut payload = Vec::with_capacity(8 + text.len().min(MAX_UNITS) * 2);
     payload.extend_from_slice(&capture.to_le_bytes());
+    if operation == BEGIN_OWNED {
+        payload.extend_from_slice(&std::process::id().to_le_bytes());
+    }
     for unit in text.encode_utf16() {
         payload.extend_from_slice(&unit.to_le_bytes());
         if payload.len() > 8 + 2 * MAX_UNITS {
@@ -303,6 +308,7 @@ impl Mailbox {
 
 pub(super) struct LiveTyping {
     mailbox: Arc<Mailbox>,
+    worker: Option<JoinHandle<()>>,
     ended: bool,
     demand: Option<ClientDemand>,
 }
@@ -317,19 +323,20 @@ impl LiveTyping {
         getrandom::fill(&mut id).ok()?;
         let id = u64::from_le_bytes(id).max(1);
         let mailbox = Arc::new(Mailbox::default());
-        let worker = mailbox.clone();
+        let worker_mailbox = mailbox.clone();
         let input = Arc::new(ManualInput {
             focus,
             window,
             id,
             state: Mutex::new(InputState::default()),
         });
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("hex-inline-dictation".into())
-            .spawn(move || run(worker, input))
+            .spawn(move || run(worker_mailbox, input))
             .ok()?;
         Some(Self {
             mailbox,
+            worker: Some(worker),
             ended: false,
             demand: Some(client_demand()),
         })
@@ -383,6 +390,11 @@ impl Drop for LiveTyping {
     fn drop(&mut self) {
         if !self.ended {
             self.mailbox.request(Request::Cancel);
+        }
+        // An idle editor can outlive this Hex process. Let the bounded native
+        // request finish so the next listener can use the same editor.
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
         }
     }
 }
@@ -481,7 +493,13 @@ impl Editor {
             self.abandoned = true;
             return;
         }
-        match self.send(BEGIN, "") {
+        let mut response = self.send(BEGIN_OWNED, "");
+        if response == Response::Declined {
+            // Editors that loaded the previous text service still speak the
+            // original protocol until Windows reloads it for that app.
+            response = self.send(BEGIN, "");
+        }
+        match response {
             Response::Applied => self.started = true,
             Response::Declined => {}
             _ => self.abandoned = self.send(CANCEL, "") == Response::Uncertain,

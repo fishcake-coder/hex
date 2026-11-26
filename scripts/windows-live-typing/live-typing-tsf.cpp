@@ -24,7 +24,9 @@ constexpr UINT kCancelInactive = WM_APP + 1;
 constexpr DWORD kMaxTextBytes = 16 * 1024;
 constexpr auto kInputSettle = std::chrono::milliseconds(120);
 
-enum class Operation : ULONG_PTR { begin = 1, update, commit, cancel, probe, accept };
+enum class Operation : ULONG_PTR {
+    begin = 1, update, commit, cancel, probe, accept, begin_owned, abandon
+};
 enum class Outcome : LRESULT { declined = 0, applied, uncertain, reanchor, selection_pending };
 
 HMODULE module = nullptr;
@@ -335,6 +337,13 @@ public:
     Outcome apply(Operation operation, std::uint64_t id, const std::wstring& text, TfEditCookie cookie) {
         if (id != capture_id_) return Outcome::declined;
         if (operation == Operation::cancel) return cancel(cookie);
+        if (operation == Operation::abandon) {
+            // A terminated client cannot confirm which edits reached the
+            // document. Release its composition without replacing any text.
+            if (!end_composition(cookie)) return Outcome::uncertain;
+            clear_capture();
+            return Outcome::applied;
+        }
         if (focus_lost_ || !still_focused()) return failure();
         if (operation == Operation::accept) {
             const bool had_preview = composition_ || external_edit_;
@@ -509,20 +518,26 @@ private:
         if (!copy || !copy->lpData || copy->cbData < sizeof(std::uint64_t) ||
             copy->cbData > sizeof(std::uint64_t) + kMaxTextBytes || (copy->cbData % 2) != 0 ||
             copy->dwData < static_cast<ULONG_PTR>(Operation::begin) ||
-            copy->dwData > static_cast<ULONG_PTR>(Operation::accept)) {
+            copy->dwData > static_cast<ULONG_PTR>(Operation::begin_owned)) {
             return Outcome::declined;
         }
         const auto op = static_cast<Operation>(copy->dwData);
-        const size_t characters = (copy->cbData - sizeof(std::uint64_t)) / sizeof(wchar_t);
-        if (op != Operation::update && op != Operation::commit && characters) {
-            return Outcome::declined;
-        }
         std::uint64_t id = 0;
         std::memcpy(&id, copy->lpData, sizeof(id));
         if (!id) return Outcome::declined;
+        const auto* bytes = static_cast<const char*>(copy->lpData);
+        if (op == Operation::begin_owned) {
+            DWORD owner = 0;
+            if (copy->cbData != sizeof(id) + sizeof(owner)) return Outcome::declined;
+            std::memcpy(&owner, bytes + sizeof(id), sizeof(owner));
+            return owner ? request(Operation::begin, id, {}, owner) : Outcome::declined;
+        }
+        const size_t characters = (copy->cbData - sizeof(id)) / sizeof(wchar_t);
+        if (op != Operation::update && op != Operation::commit && characters) {
+            return Outcome::declined;
+        }
         std::wstring text(characters, L'\0');
         if (characters) {
-            const auto* bytes = static_cast<const char*>(copy->lpData);
             std::memcpy(text.data(), bytes + sizeof(id), characters * sizeof(wchar_t));
             if (text.find(L'\0') != std::wstring::npos) return failure();
         }
@@ -553,13 +568,26 @@ private:
             same_object(document.Get(), document_.Get()) && same_object(context.Get(), context_.Get());
     }
 
-    Outcome request(Operation operation, std::uint64_t id, const std::wstring& text) {
+    Outcome request(Operation operation, std::uint64_t id, const std::wstring& text, DWORD owner = 0) {
         if (in_request_) return failure();
         if (operation == Operation::begin) {
-            if (capture_id_) return Outcome::declined;
+            if (capture_id_) {
+                if (!capture_owner_ || WaitForSingleObject(capture_owner_, 0) != WAIT_OBJECT_0) {
+                    return Outcome::declined;
+                }
+                const auto abandoned = request(Operation::abandon, capture_id_, {});
+                if (abandoned != Outcome::applied) return abandoned;
+            }
             if (!find_focus(document_, context_, target_window_)) {
                 clear_capture();
                 return Outcome::declined;
+            }
+            if (owner) {
+                capture_owner_ = OpenProcess(SYNCHRONIZE, FALSE, owner);
+                if (!capture_owner_ || WaitForSingleObject(capture_owner_, 0) != WAIT_TIMEOUT) {
+                    clear_capture();
+                    return Outcome::declined;
+                }
             }
             capture_id_ = id;
             if (SUCCEEDED(context_.As(&edit_source_))) {
@@ -568,7 +596,8 @@ private:
             }
         } else if (id != capture_id_) {
             return id == uncertain_id_ ? Outcome::uncertain : Outcome::declined;
-        } else if (operation != Operation::cancel && (focus_lost_ || !still_focused())) {
+        } else if (operation != Operation::cancel && operation != Operation::abandon &&
+                   (focus_lost_ || !still_focused())) {
             queue_cancel();
             return failure();
         }
@@ -673,6 +702,8 @@ private:
         context_.Reset();
         document_.Reset();
         target_window_ = nullptr;
+        if (capture_owner_) CloseHandle(capture_owner_);
+        capture_owner_ = nullptr;
         capture_id_ = 0;
         focus_lost_ = false;
         external_edit_ = false;
@@ -699,6 +730,7 @@ private:
     std::wstring preview_;
     wchar_t left_neighbor_ = L'\0';
     wchar_t right_neighbor_ = L'\0';
+    HANDLE capture_owner_ = nullptr;
     std::uint64_t capture_id_ = 0;
     std::uint64_t uncertain_id_ = 0;
     std::chrono::steady_clock::time_point input_settles_at_{};
