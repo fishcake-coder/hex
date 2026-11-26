@@ -3,6 +3,7 @@ param(
     [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'Hex\snapdragon'),
     [string]$SourceDir,
     [string]$ModelDir,
+    [string]$RuntimePython,
     [ValidateRange(8, 2400)]
     [int]$MelFrames = 1280,
     [ValidateRange(1, 4)]
@@ -48,17 +49,22 @@ function Install-Acceleration {
         return
     }
 
-    $uv = (Get-Command uv -ErrorAction Stop).Source
-    $python = Join-Path $RuntimeRoot 'venv\Scripts\python.exe'
-    $toolDir = Join-Path $RuntimeRoot 'unified-converter-python'
+    $python = $RuntimePython
+    $toolDir = $null
+    if (-not $python) {
+        $python = Join-Path $RuntimeRoot 'venv\Scripts\python.exe'
+        $toolDir = Join-Path $RuntimeRoot 'unified-converter-python'
+    }
     $build = Join-Path $ModelPath ('acceleration-build-' + [guid]::NewGuid().ToString('N'))
     New-Item -Path $build -ItemType Directory | Out-Null
     $previousPythonPath = $env:PYTHONPATH
     $sourceNames = @('decoder_joint.onnx', 'vocab.txt')
     try {
-        Invoke-Checked $uv @(
-            'pip', 'install', '--python', $python, '--target', $toolDir, '--no-cache', 'onnx==1.23.2'
-        )
+        if ($toolDir) {
+            Invoke-Checked (Get-Command uv -ErrorAction Stop).Source @(
+                'pip', 'install', '--python', $python, '--target', $toolDir, '--no-cache', 'onnx==1.23.2'
+            )
+        }
         $env:PYTHONPATH = $toolDir
         foreach ($name in $sourceNames) {
             Copy-Item -LiteralPath (Join-Path $ModelPath $name) -Destination $build
@@ -194,17 +200,24 @@ if (-not $hasModel -and (Test-Path -LiteralPath $ModelDir)) {
     throw "The target directory already exists. Pass a new -ModelDir: $ModelDir"
 }
 
-$uv = (Get-Command uv -ErrorAction Stop).Source
-$venv = Join-Path $root 'venv'
-$python = Join-Path $venv 'Scripts\python.exe'
-if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
-    Invoke-Checked $uv @('python', 'install', 'cpython-3.13.14-windows-aarch64')
-    Invoke-Checked $uv @('venv', '--python', 'cpython-3.13.14-windows-aarch64', $venv)
+$python = $RuntimePython
+$toolDir = $null
+if ($python) {
+    $python = (Resolve-Path -LiteralPath $python).Path
+} else {
+    $uv = (Get-Command uv -ErrorAction Stop).Source
+    $venv = Join-Path $root 'venv'
+    $python = Join-Path $venv 'Scripts\python.exe'
+    if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
+        Invoke-Checked $uv @('python', 'install', 'cpython-3.13.14-windows-aarch64')
+        Invoke-Checked $uv @('venv', '--python', 'cpython-3.13.14-windows-aarch64', $venv)
+    }
+    Invoke-Checked $uv @(
+        'pip', 'install', '--python', $python, '--no-cache',
+        'numpy==2.5.5', 'onnxruntime==1.32.0', 'onnxruntime-qnn==2.8.0'
+    )
+    $toolDir = Join-Path $root 'unified-converter-python'
 }
-Invoke-Checked $uv @(
-    'pip', 'install', '--python', $python, '--no-cache',
-    'numpy==2.5.5', 'onnxruntime==1.32.0', 'onnxruntime-qnn==2.8.0'
-)
 
 $revision = '09e9060322d99c5f070010724786e6ee090fd51d'
 $base = "https://huggingface.co/bobNight/parakeet-unified-en-0.6b-onnx/resolve/$revision"
@@ -228,12 +241,17 @@ try {
             $pending = "$destination.download"
             if (-not (Test-Path -LiteralPath $pending -PathType Leaf) -or (Get-Item -LiteralPath $pending).Length -ne $size) {
                 Invoke-Checked 'curl.exe' @(
-                    '--fail', '--location', '--retry', '3', '--continue-at', '-',
+                    '--fail', '--location', '--retry', '3', '--continue-at', '-', '--proto', '=https',
                     '--connect-timeout', '30', '--speed-time', '60', '--speed-limit', '1024',
                     '--output', $pending, "$base/$remoteName"
                 )
             }
-            Assert-Sha256 $pending $sha256
+            try {
+                Assert-Sha256 $pending $sha256
+            } catch {
+                Remove-Item -LiteralPath $pending
+                throw
+            }
             Move-Item -LiteralPath $pending -Destination $destination
         }
         Assert-Sha256 $destination $sha256
@@ -242,11 +260,12 @@ try {
     $downloadLock.Dispose()
 }
 
-$toolDir = Join-Path $root 'unified-converter-python'
-if ($hasModel) {
+if ($toolDir) {
     Invoke-Checked $uv @(
         'pip', 'install', '--python', $python, '--target', $toolDir, '--no-cache', 'onnx==1.23.2'
     )
+}
+if ($hasModel) {
     Install-Streaming $ModelDir $source $python $toolDir
     Write-Output $ModelDir
     return
@@ -257,9 +276,6 @@ $stage = Join-Path $parent ('unified-build-' + [guid]::NewGuid().ToString('N'))
 New-Item -Path $stage -ItemType Directory | Out-Null
 $previousPythonPath = $env:PYTHONPATH
 try {
-    Invoke-Checked $uv @(
-        'pip', 'install', '--python', $python, '--target', $toolDir, '--no-cache', 'onnx==1.23.2'
-    )
     $env:PYTHONPATH = $toolDir
     Invoke-Checked $python @(
         '-B', (Join-Path $PSScriptRoot 'prepare_unified_encoder.py'),

@@ -10,7 +10,7 @@ import sys
 from tempfile import NamedTemporaryFile
 
 
-DEFAULT_PROFILE = "whisper"
+DEFAULT_PROFILE = os.environ.get("HEX_SNAPDRAGON_DEFAULT_PROFILE", "whisper")
 HYBRID_GRAPH_DEVICES = {"encoder": "htp", "decoder_joint": "cpu", "preprocessor": "cpu"}
 PROFILES = {
     "whisper": ("whisper_qnn.py", "models", {"precision": "w8a16"}),

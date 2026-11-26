@@ -3,7 +3,8 @@ param(
     [string]$LlvmBin,
     [ValidateRange(1, 32)][int]$Jobs = 5,
     [switch]$Clippy,
-    [switch]$BuildOnly
+    [switch]$BuildOnly,
+    [switch]$PublicBuild
 )
 
 $ErrorActionPreference = 'Stop'
@@ -65,6 +66,25 @@ $env:CL = '/EHsc'
 $env:TRANSCRIBE_CMAKE_ARGS = '-DGGML_NATIVE=OFF -DGGML_OPENMP=OFF'
 $env:HEX_LOCAL_BUILD = '1'
 
+$previousRustFlags = $env:CARGO_ENCODED_RUSTFLAGS
+$previousCFlags = $env:CFLAGS
+$previousTargetCFlags = $env:CFLAGS_aarch64_pc_windows_msvc
+$previousCxxFlags = $env:CXXFLAGS
+$previousFixtureRoot = $env:HEX_SCENE_ASSET_ROOT
+if ($PublicBuild) {
+    $env:CARGO_ENCODED_RUSTFLAGS = @(
+        "--remap-path-prefix=$env:USERPROFILE=/hex-build",
+        '-C', 'link-arg=/PDBALTPATH:%_PDB%'
+    ) -join [char]31
+    $nativeRemap = "/clang:-ffile-prefix-map=$env:USERPROFILE=/hex-build"
+    $env:CFLAGS = $nativeRemap
+    # QuickJS sets CFLAGS itself. The cc crate also reads the target-specific flags.
+    $env:CFLAGS_aarch64_pc_windows_msvc = $nativeRemap
+    $env:CXXFLAGS = $nativeRemap
+    $env:TRANSCRIBE_CMAKE_ARGS += " `"-DCMAKE_C_FLAGS=$nativeRemap`" `"-DCMAKE_CXX_FLAGS=$nativeRemap`""
+    $env:HEX_SCENE_ASSET_ROOT = '.'
+}
+
 $commonArgs = @('--locked', '--release', '--target', $target, '--target-dir', $targetDir,
     '--jobs', $Jobs, '--workspace', '--bin', 'hex', '--bin', 'hex-console')
 Push-Location (Split-Path -Parent $PSScriptRoot)
@@ -89,4 +109,9 @@ try {
     Write-Host "Built $bin\hex.exe (desktop) and $bin\hex.com (CLI)."
 } finally {
     Pop-Location
+    $env:CARGO_ENCODED_RUSTFLAGS = $previousRustFlags
+    $env:CFLAGS = $previousCFlags
+    $env:CFLAGS_aarch64_pc_windows_msvc = $previousTargetCFlags
+    $env:CXXFLAGS = $previousCxxFlags
+    $env:HEX_SCENE_ASSET_ROOT = $previousFixtureRoot
 }

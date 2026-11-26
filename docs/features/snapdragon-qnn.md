@@ -1,8 +1,23 @@
 # Snapdragon QNN dictation
 
-This local Windows ARM64 build runs Whisper and Parakeet models through the
-Qualcomm QNN execution provider on the Hexagon NPU. The launcher opts in for
-the process it starts. A fresh installation starts with Whisper Large v3 Turbo.
+Hex Snapdragon runs speech recognition through the Qualcomm QNN execution
+provider on the Hexagon NPU. The Windows installer defaults to streaming
+Parakeet Unified English. The source-build launcher defaults to Whisper
+Large v3 Turbo.
+
+## Windows installer
+
+Download **Hex-Snapdragon-Setup-arm64.exe** from
+[GitHub Releases](https://github.com/fishcake-coder/hex/releases). Run it on a
+Qualcomm Snapdragon PC with Windows 11 24H2 or later, then open **Hex Snapdragon**
+from Start. First-time setup needs an internet connection and about 5 GB of
+free disk space for the runtime and model. Subsequent dictation runs locally.
+The installer is unsigned. Its release includes a SHA-256 checksum.
+
+To build the installer from source on Windows ARM64, install Inno Setup 6.7.4
+and run `scripts/build-snapdragon-installer.ps1 -Version 0.1.0`.
+
+## Source build
 
 ```ts
 Hex Snapdragon NPU                           // dictation.snapdragon-qnn

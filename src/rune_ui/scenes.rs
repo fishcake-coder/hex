@@ -415,10 +415,10 @@ pub(super) const SCENES: &[Scene] = &[
     // the microphone released while idle, when no audio arrives.
     ("mac-settings-mic-level", |ui| {
         *ui = mac_fixture();
-        ui.mic_level = general::MicLevel::playing(std::path::Path::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/vocabulary/audio/term-opencode-2.wav"
-        )));
+        let root = option_env!("HEX_SCENE_ASSET_ROOT").unwrap_or(env!("CARGO_MANIFEST_DIR"));
+        let audio =
+            std::path::Path::new(root).join("tests/fixtures/vocabulary/audio/term-opencode-2.wav");
+        ui.mic_level = general::MicLevel::playing(&audio);
     }),
     ("mac-settings-mic-released", |ui| {
         *ui = mac_fixture();
