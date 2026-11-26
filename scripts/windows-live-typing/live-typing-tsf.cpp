@@ -7,6 +7,7 @@
 #include <wrl/client.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <new>
@@ -21,7 +22,7 @@ constexpr CLSID kBridgeClsid{
 constexpr wchar_t kWindowClass[] = L"HexLiveTyping.Tsf2";
 constexpr UINT kCancelInactive = WM_APP + 1;
 constexpr DWORD kMaxTextBytes = 16 * 1024;
-constexpr ULONGLONG kInputSettleMs = 120;
+constexpr auto kInputSettle = std::chrono::milliseconds(120);
 
 enum class Operation : ULONG_PTR { begin = 1, update, commit, cancel, probe, accept };
 enum class Outcome : LRESULT { declined = 0, applied, uncertain, reanchor, selection_pending };
@@ -342,15 +343,19 @@ public:
             reanchor_pending_ |= had_preview;
             // A preview sent concurrently with the input hook must wait for
             // the key or click to reach the editor after the hook returns.
-            input_settles_at_ = GetTickCount64() + kInputSettleMs;
+            input_settles_at_ = std::chrono::steady_clock::now() + kInputSettle;
             return Outcome::applied;
         }
         if (reanchor_pending_) {
             reanchor_pending_ = false;
             return Outcome::reanchor;
         }
+        if (operation == Operation::commit && text.empty() && !composition_ && !external_edit_) {
+            clear_capture();
+            return Outcome::applied;
+        }
         if ((operation == Operation::update || operation == Operation::commit) &&
-            GetTickCount64() < input_settles_at_) return Outcome::selection_pending;
+            std::chrono::steady_clock::now() < input_settles_at_) return Outcome::selection_pending;
         ComPtr<ITfRange> selection = current_selection(context_.Get(), cookie);
         BOOL collapsed = FALSE;
         if (!selection || FAILED(selection->IsEmpty(cookie, &collapsed)) ||
@@ -375,10 +380,6 @@ public:
             return accept_external_edit(cookie);
         }
 
-        if (operation == Operation::commit && text.empty() && !composition_) {
-            clear_capture();
-            return Outcome::applied;
-        }
         if (!collapsed) return Outcome::selection_pending;
 
         if (!composition_) {
@@ -676,7 +677,7 @@ private:
         focus_lost_ = false;
         external_edit_ = false;
         reanchor_pending_ = false;
-        input_settles_at_ = 0;
+        input_settles_at_ = {};
         preview_.clear();
         left_neighbor_ = right_neighbor_ = L'\0';
     }
@@ -700,7 +701,7 @@ private:
     wchar_t right_neighbor_ = L'\0';
     std::uint64_t capture_id_ = 0;
     std::uint64_t uncertain_id_ = 0;
-    ULONGLONG input_settles_at_ = 0;
+    std::chrono::steady_clock::time_point input_settles_at_{};
     bool focus_lost_ = false;
     bool external_edit_ = false;
     bool reanchor_pending_ = false;
