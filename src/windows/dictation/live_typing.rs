@@ -2,20 +2,21 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::Foundation::{HWND, POINT};
 use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     FindWindowExW, GUITHREADINFO, GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId,
-    HWND_MESSAGE, SMTO_ABORTIFHUNG, SMTO_BLOCK, SMTO_ERRORONEXIT, SendMessageTimeoutW, WM_COPYDATA,
+    HWND_MESSAGE, IsChild, SMTO_ABORTIFHUNG, SMTO_BLOCK, SMTO_ERRORONEXIT, SendMessageTimeoutW,
+    WM_COPYDATA, WindowFromPoint,
 };
 
 use crate::dictation::live_text::{ClientDemand, client_demand};
 use crate::transcription::engine::Partial;
 
-const CLASS: windows::core::PCWSTR = windows::core::w!("HexLiveTyping.Tsf");
+const CLASS: windows::core::PCWSTR = windows::core::w!("HexLiveTyping.Tsf2");
 const MAX_UNITS: usize = 8_192;
 const MESSAGE_MS: u32 = 65;
 const BEGIN: usize = 1;
@@ -23,8 +24,10 @@ const UPDATE: usize = 2;
 const COMMIT: usize = 3;
 const CANCEL: usize = 4;
 const PROBE: usize = 5;
+const ACCEPT: usize = 6;
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(240);
 const SELECTION_RECHECK: Duration = Duration::from_millis(120);
+const INPUT_SETTLE: Duration = Duration::from_millis(120);
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) struct Focus {
@@ -131,6 +134,93 @@ fn send(window: isize, capture: u64, operation: usize, text: &str) -> Response {
     }
 }
 
+static EDITOR_INPUT: Mutex<Weak<ManualInput>> = Mutex::new(Weak::new());
+
+#[derive(Default)]
+struct InputState {
+    armed: bool,
+    uncertain: bool,
+    settle_by: Option<Instant>,
+}
+
+struct ManualInput {
+    focus: Focus,
+    window: isize,
+    id: u64,
+    // Only one native request at a time. In particular, a preview must be
+    // acknowledged before the hook can hand its text to the editor.
+    state: Mutex<InputState>,
+}
+
+impl ManualInput {
+    fn send(&self, operation: usize, text: &str) -> Response {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.uncertain {
+            // The editor may have already processed the input. Retry only
+            // relinquishing the span, never cancel or replace its text.
+            if Focus::current() != Some(self.focus)
+                || send(self.window, self.id, ACCEPT, "") != Response::Applied
+            {
+                return Response::Uncertain;
+            }
+            state.uncertain = false;
+            state.settle_by = Some(Instant::now() + INPUT_SETTLE);
+        }
+        let response = send(self.window, self.id, operation, text);
+        if operation == UPDATE && response == Response::Applied {
+            state.armed = !text.is_empty();
+        } else if response == Response::Reanchor || operation == CANCEL || operation == COMMIT {
+            state.armed = false;
+        }
+        response
+    }
+
+    fn wait_for_input(&self, deadline: Instant) {
+        let settle_by = self
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .settle_by;
+        if let Some(settle_by) = settle_by {
+            let last_send = deadline - Duration::from_millis(u64::from(MESSAGE_MS));
+            std::thread::sleep(
+                settle_by
+                    .min(last_send)
+                    .saturating_duration_since(Instant::now()),
+            );
+        }
+    }
+}
+
+/// Runs before the hook forwards an edit or caret movement. Some controls
+/// keep returning their cached TSF composition after their editor changes.
+pub(in crate::windows) fn before_editor_input(point: Option<POINT>, edits: impl FnOnce() -> bool) {
+    let input = EDITOR_INPUT
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .upgrade();
+    let Some(input) = input else { return };
+    let mut state = input
+        .state
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if !state.armed || !edits() || Focus::current() != Some(input.focus) {
+        return;
+    }
+    if let Some(point) = point {
+        // SAFETY: these calls only compare the hit-tested window to the
+        // original, still-focused control.
+        let hit = unsafe { WindowFromPoint(point) };
+        let control = input.focus.control as HWND;
+        if hit != control && unsafe { IsChild(control, hit) } == 0 {
+            return;
+        }
+    }
+    state.armed = false;
+    state.uncertain = send(input.window, input.id, ACCEPT, "") != Response::Applied;
+    state.settle_by = Some(Instant::now() + INPUT_SETTLE);
+}
+
 pub(super) enum Commit {
     Inserted,
     Paste,
@@ -228,9 +318,15 @@ impl LiveTyping {
         let id = u64::from_le_bytes(id).max(1);
         let mailbox = Arc::new(Mailbox::default());
         let worker = mailbox.clone();
+        let input = Arc::new(ManualInput {
+            focus,
+            window,
+            id,
+            state: Mutex::new(InputState::default()),
+        });
         std::thread::Builder::new()
             .name("hex-inline-dictation".into())
-            .spawn(move || run(worker, focus, window, id))
+            .spawn(move || run(worker, input))
             .ok()?;
         Some(Self {
             mailbox,
@@ -291,11 +387,9 @@ impl Drop for LiveTyping {
     }
 }
 
-fn run(mailbox: Arc<Mailbox>, focus: Focus, window: isize, id: u64) {
+fn run(mailbox: Arc<Mailbox>, input: Arc<ManualInput>) {
     let mut editor = Editor {
-        focus,
-        window,
-        id,
+        input,
         started: false,
         abandoned: false,
         shown: false,
@@ -303,6 +397,11 @@ fn run(mailbox: Arc<Mailbox>, focus: Focus, window: isize, id: u64) {
         point: EditPoint::default(),
     };
     editor.begin();
+    if editor.started {
+        *EDITOR_INPUT
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Arc::downgrade(&editor.input);
+    }
     let mut retry = None;
     loop {
         let (request, preview) = {
@@ -364,9 +463,7 @@ fn run(mailbox: Arc<Mailbox>, focus: Focus, window: isize, id: u64) {
 }
 
 struct Editor {
-    focus: Focus,
-    window: isize,
-    id: u64,
+    input: Arc<ManualInput>,
     started: bool,
     abandoned: bool,
     shown: bool,
@@ -376,11 +473,11 @@ struct Editor {
 
 impl Editor {
     fn send(&self, operation: usize, text: &str) -> Response {
-        send(self.window, self.id, operation, text)
+        self.input.send(operation, text)
     }
 
     fn begin(&mut self) {
-        if Focus::current() != Some(self.focus) {
+        if Focus::current() != Some(self.input.focus) {
             self.abandoned = true;
             return;
         }
@@ -397,7 +494,7 @@ impl Editor {
     }
 
     fn focused(&mut self) -> bool {
-        if Focus::current() == Some(self.focus) {
+        if Focus::current() == Some(self.input.focus) {
             return true;
         }
         self.cancel();
@@ -422,6 +519,7 @@ impl Editor {
     }
 
     fn finish(&mut self, text: &str, deadline: Instant) -> Commit {
+        self.input.wait_for_input(deadline);
         if !enough_time(deadline) {
             self.cancel();
             return Commit::Uncertain;
@@ -432,7 +530,7 @@ impl Editor {
         if self.point.0.is_none() && !self.shown {
             // An older bridge or an ineligible textbox may never have owned
             // any text. End its empty session before using ordinary paste.
-            if self.cancel() && Focus::current() == Some(self.focus) {
+            if self.cancel() && Focus::current() == Some(self.input.focus) {
                 return Commit::Paste;
             }
             return Commit::Copy;

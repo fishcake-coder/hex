@@ -154,6 +154,9 @@ A supported focused field displays the provisional transcript while the
 same Snapdragon worker runs recognition. In Toggle mode, you can edit or
 move the caret mid-dictation and continue speaking there. Stopping commits
 the latest span. Escape clears the current preview and leaves your edits.
+To upgrade an existing text service, rebuild it, then run
+`install.ps1 -Action Update` in an elevated PowerShell. Reopen any text
+editor or browser that was already using the service.
 The Windows text service receives transcript text and no microphone audio. Use
 `-Action Disable` from your regular user session to deactivate the speech
 profile and `-Action Unregister` from an elevated PowerShell to remove its

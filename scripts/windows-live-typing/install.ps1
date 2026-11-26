@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
-    [ValidateSet('Register', 'Unregister', 'Enable', 'Disable', 'Status')]
+    [ValidateSet('Register', 'Update', 'Unregister', 'Enable', 'Disable', 'Status')]
     [string]$Action,
     [string]$BuildDir = (Join-Path $env:LOCALAPPDATA 'HexSnapdragonBuild\live-typing')
 )
@@ -15,7 +15,7 @@ $tool = Join-Path $directory 'HexLiveTypingProfile.exe'
 $registration = 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Classes\CLSID\{BE2D82D0-E30D-4BAF-A7E8-446262604B1F}'
 $server = Join-Path $registration 'InprocServer32'
 
-if ($Action -in @('Register', 'Unregister')) {
+if ($Action -in @('Register', 'Update', 'Unregister')) {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = [Security.Principal.WindowsPrincipal]::new($identity)
     if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -56,6 +56,32 @@ if ($Action -eq 'Register') {
         throw
     }
     Write-Output 'Hex Live Typing is registered. Use Enable in a regular PowerShell.'
+    return
+}
+
+if ($Action -eq 'Update') {
+    if (-not (Test-Path -LiteralPath $registration)) {
+        throw 'Register the Hex Live Typing text service first.'
+    }
+    $source = Join-Path $BuildDir 'HexLiveTypingTsf.dll'
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+        throw 'Build the native text service first with build.ps1.'
+    }
+    if ((Get-FileHash -LiteralPath $source).Hash -eq (Get-FileHash -LiteralPath $binary).Hash) {
+        Write-Output 'Hex Live Typing already has this text service.'
+        return
+    }
+    $update = [Guid]::NewGuid().ToString('N')
+    $incoming = Join-Path $directory "HexLiveTypingTsf.$update.new.dll"
+    $backup = Join-Path $directory "HexLiveTypingTsf.$update.previous.dll"
+    try {
+        Copy-Item -LiteralPath $source -Destination $incoming
+        [IO.File]::Replace($incoming, $binary, $backup)
+    } finally {
+        if (Test-Path -LiteralPath $incoming) { Remove-Item -LiteralPath $incoming }
+    }
+    Write-Output "Hex Live Typing was updated. The previous DLL is at $backup"
+    Write-Output 'Reopen apps that already loaded the text service.'
     return
 }
 

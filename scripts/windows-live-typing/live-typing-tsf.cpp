@@ -18,11 +18,12 @@ using Microsoft::WRL::ComPtr;
 
 constexpr CLSID kBridgeClsid{
     0xbe2d82d0, 0xe30d, 0x4baf, {0xa7, 0xe8, 0x44, 0x62, 0x62, 0x60, 0x4b, 0x1f}};
-constexpr wchar_t kWindowClass[] = L"HexLiveTyping.Tsf";
+constexpr wchar_t kWindowClass[] = L"HexLiveTyping.Tsf2";
 constexpr UINT kCancelInactive = WM_APP + 1;
 constexpr DWORD kMaxTextBytes = 16 * 1024;
+constexpr ULONGLONG kInputSettleMs = 120;
 
-enum class Operation : ULONG_PTR { begin = 1, update, commit, cancel, probe };
+enum class Operation : ULONG_PTR { begin = 1, update, commit, cancel, probe, accept };
 enum class Outcome : LRESULT { declined = 0, applied, uncertain, reanchor, selection_pending };
 
 HMODULE module = nullptr;
@@ -334,6 +335,22 @@ public:
         if (id != capture_id_) return Outcome::declined;
         if (operation == Operation::cancel) return cancel(cookie);
         if (focus_lost_ || !still_focused()) return failure();
+        if (operation == Operation::accept) {
+            const bool had_preview = composition_ || external_edit_;
+            const Outcome accepted = accept_external_edit(cookie);
+            if (accepted != Outcome::reanchor) return accepted;
+            reanchor_pending_ |= had_preview;
+            // A preview sent concurrently with the input hook must wait for
+            // the key or click to reach the editor after the hook returns.
+            input_settles_at_ = GetTickCount64() + kInputSettleMs;
+            return Outcome::applied;
+        }
+        if (reanchor_pending_) {
+            reanchor_pending_ = false;
+            return Outcome::reanchor;
+        }
+        if ((operation == Operation::update || operation == Operation::commit) &&
+            GetTickCount64() < input_settles_at_) return Outcome::selection_pending;
         ComPtr<ITfRange> selection = current_selection(context_.Get(), cookie);
         BOOL collapsed = FALSE;
         if (!selection || FAILED(selection->IsEmpty(cookie, &collapsed)) ||
@@ -491,12 +508,12 @@ private:
         if (!copy || !copy->lpData || copy->cbData < sizeof(std::uint64_t) ||
             copy->cbData > sizeof(std::uint64_t) + kMaxTextBytes || (copy->cbData % 2) != 0 ||
             copy->dwData < static_cast<ULONG_PTR>(Operation::begin) ||
-            copy->dwData > static_cast<ULONG_PTR>(Operation::probe)) {
+            copy->dwData > static_cast<ULONG_PTR>(Operation::accept)) {
             return Outcome::declined;
         }
         const auto op = static_cast<Operation>(copy->dwData);
         const size_t characters = (copy->cbData - sizeof(std::uint64_t)) / sizeof(wchar_t);
-        if ((op == Operation::begin || op == Operation::cancel || op == Operation::probe) && characters) {
+        if (op != Operation::update && op != Operation::commit && characters) {
             return Outcome::declined;
         }
         std::uint64_t id = 0;
@@ -658,6 +675,8 @@ private:
         capture_id_ = 0;
         focus_lost_ = false;
         external_edit_ = false;
+        reanchor_pending_ = false;
+        input_settles_at_ = 0;
         preview_.clear();
         left_neighbor_ = right_neighbor_ = L'\0';
     }
@@ -681,8 +700,10 @@ private:
     wchar_t right_neighbor_ = L'\0';
     std::uint64_t capture_id_ = 0;
     std::uint64_t uncertain_id_ = 0;
+    ULONGLONG input_settles_at_ = 0;
     bool focus_lost_ = false;
     bool external_edit_ = false;
+    bool reanchor_pending_ = false;
     bool in_request_ = false;
     bool ending_composition_ = false;
 };

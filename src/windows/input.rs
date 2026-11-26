@@ -793,6 +793,7 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
     );
     if handled.ends_continuation(is_down, ModifierState::is_modifier(vk), event.dwExtraInfo) {
         activity::invalidate();
+        super::dictation::before_editor_input(None, || edits_or_moves_caret(event.vkCode));
     }
     match handled.disposition {
         Disposition::Pass => unsafe { CallNextHookEx(ptr::null_mut(), code, wparam, lparam) },
@@ -802,6 +803,29 @@ unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARA
         // let the release through rather than leave the key held.
         Disposition::Mask => unsafe { CallNextHookEx(ptr::null_mut(), code, wparam, lparam) },
     }
+}
+
+fn edits_or_moves_caret(vk: u32) -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        VK_BACK, VK_DELETE, VK_DOWN, VK_END, VK_HOME, VK_INSERT, VK_LEFT, VK_NEXT, VK_PRIOR,
+        VK_RIGHT, VK_UP,
+    };
+    if key_down(VK_LWIN) || key_down(VK_RWIN) {
+        return false;
+    }
+    match vk as u16 {
+        VK_BACK | VK_DELETE | VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN | VK_HOME | VK_END
+        | VK_PRIOR | VK_NEXT => return true,
+        VK_INSERT => return key_down(VK_SHIFT),
+        _ => {}
+    }
+    if key_down(VK_CONTROL) && !key_down(VK_RMENU) {
+        return matches!(vk, 0x41 | 0x56 | 0x58 | 0x59 | 0x5A);
+    }
+    if key_down(VK_LMENU) || vk == u32::from(VK_TAB) {
+        return false;
+    }
+    matches!(vk, 0xE5 | 0xE7) || unsafe { MapVirtualKeyW(vk, MAPVK_VK_TO_CHAR) } != 0
 }
 
 /// Taps the mask key, then replays the swallowed release, so the system
@@ -885,6 +909,7 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
             let handled = process_button(vk, LeftControl::Other, down, event.time, key_down);
             if handled.ends_continuation(down, false, event.dwExtraInfo) {
                 activity::invalidate();
+                super::dictation::before_editor_input(Some(event.pt), || vk <= 0x04);
             }
             if handled.disposition != Disposition::Pass {
                 return 1;

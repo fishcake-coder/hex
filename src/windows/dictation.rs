@@ -29,6 +29,7 @@ mod output;
 mod shortcuts;
 
 use finish::submit_capture;
+pub(super) use live_typing::before_editor_input;
 use live_typing::{Focus, LiveTyping};
 use output::{process_dictation_job, process_paste_last};
 use shortcuts::{Shortcuts, next_action};
