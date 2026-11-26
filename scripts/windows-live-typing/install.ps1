@@ -63,24 +63,30 @@ if ($Action -eq 'Update') {
     if (-not (Test-Path -LiteralPath $registration)) {
         throw 'Register the Hex Live Typing text service first.'
     }
-    $source = Join-Path $BuildDir 'HexLiveTypingTsf.dll'
-    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
-        throw 'Build the native text service first with build.ps1.'
+    $updates = foreach ($destination in $tool, $binary) {
+        $source = Join-Path $BuildDir (Split-Path -Leaf $destination)
+        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+            throw 'Build the native text service first with build.ps1.'
+        }
+        if ((Get-FileHash -LiteralPath $source).Hash -ne (Get-FileHash -LiteralPath $destination).Hash) {
+            @{ Source = $source; Destination = $destination }
+        }
     }
-    if ((Get-FileHash -LiteralPath $source).Hash -eq (Get-FileHash -LiteralPath $binary).Hash) {
-        Write-Output 'Hex Live Typing already has this text service.'
-        return
+    foreach ($file in $updates) {
+        $update = [Guid]::NewGuid().ToString('N')
+        $incoming = "$($file.Destination).$update.new"
+        $backup = "$($file.Destination).$update.previous"
+        try {
+            Copy-Item -LiteralPath $file.Source -Destination $incoming
+            [IO.File]::Replace($incoming, $file.Destination, $backup)
+        } finally {
+            if (Test-Path -LiteralPath $incoming) { Remove-Item -LiteralPath $incoming }
+        }
+        Write-Output "Previous file saved at $backup"
     }
-    $update = [Guid]::NewGuid().ToString('N')
-    $incoming = Join-Path $directory "HexLiveTypingTsf.$update.new.dll"
-    $backup = Join-Path $directory "HexLiveTypingTsf.$update.previous.dll"
-    try {
-        Copy-Item -LiteralPath $source -Destination $incoming
-        [IO.File]::Replace($incoming, $binary, $backup)
-    } finally {
-        if (Test-Path -LiteralPath $incoming) { Remove-Item -LiteralPath $incoming }
-    }
-    Write-Output "Hex Live Typing was updated. The previous DLL is at $backup"
+    & $tool register
+    if ($LASTEXITCODE -ne 0) { throw 'Windows did not refresh the Hex speech profiles.' }
+    Write-Output 'Hex Live Typing and its language profiles are up to date.'
     Write-Output 'Reopen apps that already loaded the text service.'
     return
 }

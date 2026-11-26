@@ -169,6 +169,8 @@ A supported focused field displays the provisional transcript while the
 same Snapdragon worker runs recognition. In Toggle mode, you can edit or
 move the caret mid-dictation and continue speaking there. Stopping commits
 the latest span. Escape clears the current preview and leaves your edits.
+The Windows text service supports English (UK and US) and Hebrew keyboard
+layouts. The selected speech model still determines the recognition language.
 To upgrade an existing text service, rebuild it, then run
 `install.ps1 -Action Update` in an elevated PowerShell. Reopen any text
 editor or browser that was already using the service.

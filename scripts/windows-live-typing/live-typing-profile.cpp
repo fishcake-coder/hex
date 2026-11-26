@@ -14,7 +14,9 @@ constexpr CLSID bridge{
 constexpr GUID profile{
     0xaf663182, 0x0c21, 0x46c8, {0x8f, 0x6d, 0xe3, 0xf2, 0x23, 0x4b, 0x7d, 0x48}};
 constexpr wchar_t name[] = L"Hex Live Typing";
-constexpr LANGID languages[]{0x0809, 0x0409};
+// The text service inserts the model's output into the selected keyboard
+// layout. These profiles do not select a speech recognition language.
+constexpr LANGID languages[]{0x0809, 0x0409, 0x040d};
 
 bool supported(LANGID language) {
     for (const auto entry : languages) {
@@ -210,7 +212,7 @@ HRESULT user_profile(ITfInputProcessorProfiles* profiles, std::wstring_view comm
     }
 
     if (!supported(language)) {
-        std::fputs("Select an English (UK or US) Windows input language first.\n", stderr);
+        std::fputs("Select an English (UK or US) or Hebrew Windows input language first.\n", stderr);
         return E_INVALIDARG;
     }
     if (speech.hex_active) return S_OK;
