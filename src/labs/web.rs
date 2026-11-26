@@ -28,6 +28,9 @@ impl Feature {
     /// one line here, and `site/src/labs.json` is the same file on every OS.
     const fn web_summary(self) -> &'static str {
         match self {
+            Self::LiveTyping => {
+                "Show words as you speak in a compatible field on Wayland or with Live typing in textbox on Windows"
+            }
             Self::StandaloneSpecialKeys => {
                 "Use a special key alone as a shortcut: Insert, Home, End, Page Up, or Page Down on Windows, and Menu, Pause, or Scroll Lock on Linux"
             }

@@ -33,20 +33,29 @@ $object = Join-Path $output 'live-typing-tsf.obj'
 $dll = Join-Path $output 'HexLiveTypingTsf.dll'
 $importLibrary = Join-Path $output 'HexLiveTypingTsf.lib'
 $exports = Join-Path $PSScriptRoot 'live-typing-tsf.def'
-$flags = @(
-    '/nologo', '/LD', '/std:c++17', '/EHsc', '/O2', '/MT', '/W4', '/WX',
-    $source, "/Fo:$object", "/Fe:$dll",
-    'user32.lib', 'ole32.lib', 'oleaut32.lib', 'uuid.lib', '/link',
-    "/IMPLIB:$importLibrary", "/DEF:$exports"
-)
-& cl.exe @flags | Out-Host
-if ($LASTEXITCODE -ne 0) {
-    throw "Native compiler exited with code $LASTEXITCODE."
+$flags = @('/nologo', '/std:c++17', '/EHsc', '/O2', '/MT', '/W4', '/WX')
+$libraries = @('user32.lib', 'ole32.lib', 'oleaut32.lib', 'uuid.lib')
+& cl.exe @flags /c $source "/Fo:$object" | Out-Host
+if ($LASTEXITCODE -ne 0) { throw "Native compiler exited with code $LASTEXITCODE." }
+
+$objects = @($object)
+$machine = @('/MACHINE:X64')
+if ($arch -eq 'arm64') {
+    # Native ARM64 and emulated x64 share the 64-bit COM registration view.
+    # Link both implementations into the same DLL so either host can load it.
+    $hybridObject = Join-Path $output 'live-typing-tsf-arm64ec.obj'
+    & cl.exe @flags /c /arm64EC $source "/Fo:$hybridObject" | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw "ARM64EC compiler exited with code $LASTEXITCODE." }
+    $objects += $hybridObject
+    $machine = @('/MACHINE:ARM64X', "/DEFARM64NATIVE:$exports")
 }
+& link.exe /nologo /WX /DLL @machine "/DEF:$exports" "/OUT:$dll" "/IMPLIB:$importLibrary" @objects @libraries | Out-Host
+if ($LASTEXITCODE -ne 0) { throw "Windows text service linker exited with code $LASTEXITCODE." }
+
 $profileSource = Join-Path $PSScriptRoot 'live-typing-profile.cpp'
 $profileObject = Join-Path $output 'live-typing-profile.obj'
 $profile = Join-Path $output 'HexLiveTypingProfile.exe'
-& cl.exe /nologo /std:c++17 /EHsc /O2 /MT /W4 /WX $profileSource "/Fo:$profileObject" "/Fe:$profile" ole32.lib uuid.lib | Out-Host
+& cl.exe @flags $profileSource "/Fo:$profileObject" "/Fe:$profile" ole32.lib uuid.lib | Out-Host
 if ($LASTEXITCODE -ne 0) {
     throw "Windows text profile compiler exited with code $LASTEXITCODE."
 }

@@ -10,7 +10,10 @@ use crate::control::PrintedTranscript;
 use crate::dictation::paste_last::LastDictation;
 use crate::windows::paste::{Paste, WindowsPaster};
 
-use super::{Job, JobResult, OutputKind, live_typing::Commit};
+use super::{
+    Job, JobResult, OutputKind,
+    live_typing::{Commit, LiveTyping},
+};
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn process_dictation_job(
@@ -56,90 +59,120 @@ pub(super) fn process_dictation_job(
         if raw_text.is_empty() {
             return Err("transcription was empty".into());
         }
-        let mut processed = if job.flavour.raw() {
-            crate::dictation::processor::Processed::unchanged(raw_text.trim())
-        } else {
-            let mode_runtime = mode_runtime
-                .read()
-                .unwrap_or_else(|error| error.into_inner())
-                .clone();
-            mode_runtime.process(
-                &raw_text,
-                &job.language,
-                &context,
-                transformations,
-                crate::dictation::processor::Source::Dictation,
-            )
-        };
-        let mut text = processed.text.clone();
-        // A voice prompt that deliberately asked nothing ends quietly: no
-        // failure, no paste, no last dictation, and no History.
-        if processed.nothing {
-            return Ok(text);
-        }
-        if text.trim().is_empty() {
-            return Err("text replacements produced empty output".into());
-        }
-        // Labs › Signature: a normal, unprinted dictation carries the saved
-        // line once at its end. History and Paste Last read the same text,
-        // and the paste is standalone so the next dictation never continues
-        // the signature line.
-        let signed = if !printed && !job.flavour.raw() {
-            match crate::dictation::signature::append(
-                &text,
-                &crate::labs::signature_text(),
-                crate::labs::signature(),
-            ) {
-                Some(signed) => {
-                    text = signed;
-                    processed.text = text.clone();
-                    true
-                }
-                None => false,
+        let mut inline = job.inline.take();
+        let mut point = inline.as_ref().and_then(LiveTyping::prepare);
+        let mut reprocessed = false;
+        let (processed, text) = loop {
+            let remaining = match &point {
+                Some(point) => point.suffix(&raw_text),
+                None if inline.is_none() => Some(raw_text.trim()),
+                None => None,
+            };
+            let needs_manual_paste = remaining.is_none();
+            let remaining = remaining.unwrap_or(raw_text.trim());
+            let already_accepted = remaining.is_empty();
+            let mut processed = if job.flavour.raw() || already_accepted {
+                crate::dictation::processor::Processed::unchanged(remaining)
+            } else {
+                let mode_runtime = mode_runtime
+                    .read()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone();
+                mode_runtime.process(
+                    remaining,
+                    &job.language,
+                    &context,
+                    transformations,
+                    crate::dictation::processor::Source::Dictation,
+                )
+            };
+            let mut text = processed.text.clone();
+            // A voice prompt that deliberately asked nothing ends quietly.
+            if processed.nothing {
+                return Ok(text);
             }
-        } else {
-            false
-        };
-        // A printed dictation is never pasted, and Paste Last skips it.
-        if !printed {
-            let paster = paster.as_mut().map_err(|error| format!("{error:#}"))?;
-            // Labs › YOLO mode, read as the output commits.
-            let sends = job.by_shortcut
-                && !job.flavour.raw()
-                && crate::dictation::yolo_mode::sends(application.as_deref(), None);
-            // Labs › Copy dictation only, read as the output commits:
-            // dictations go to the clipboard unpasted; Paste Last still pastes.
-            // A dictation YOLO mode sends is pasted anyway.
-            let copy_only = crate::labs::copy_only() && !sends;
-            let pasted = if copy_only {
-                job.inline.take();
-                paster.copy_only(&text).map(|()| Paste::Copied)
-            } else {
-                match job.inline.take().map(|inline| inline.finish(&text)) {
-                    Some(Commit::Inserted) => Ok(Paste::Sent),
-                    Some(Commit::Copy) => paster.copy_only(&text).map(|()| Paste::Copied),
-                    Some(Commit::Uncertain) => Err(color_eyre::eyre::eyre!(
-                        "the text service did not confirm the inline commit"
-                    )),
-                    Some(Commit::Paste) | None => {
-                        paster.paste(&text, job.flavour.terminal_paste(), job.return_to, signed)
+            if !already_accepted && text.trim().is_empty() {
+                return Err("text replacements produced empty output".into());
+            }
+            // Labs › Signature: a normal, unprinted dictation carries the
+            // saved line once at its end.
+            let mut signed = if !printed && !job.flavour.raw() && !already_accepted {
+                match crate::dictation::signature::append(
+                    &text,
+                    &crate::labs::signature_text(),
+                    crate::labs::signature(),
+                ) {
+                    Some(signed) => {
+                        text = signed;
+                        processed.text = text.clone();
+                        true
                     }
+                    None => false,
                 }
-            };
-            sent = matches!(pasted, Ok(Paste::Sent)) && sends;
-            let pasted = if sent {
-                paster.press_return().map(|()| Paste::Sent)
             } else {
-                pasted
+                false
             };
-            copied = matches!(pasted, Ok(Paste::Copied));
-            // A failed paste still keeps the text for Paste Last.
-            *last_dictation
-                .lock()
-                .unwrap_or_else(|error| error.into_inner()) =
-                Some(LastDictation::new(text.clone(), signed));
-            pasted.map_err(|error| format!("{error:#}"))?;
-        }
+            // A printed dictation is never pasted, and Paste Last skips it.
+            if !printed {
+                let paster = paster.as_mut().map_err(|error| format!("{error:#}"))?;
+                // Labs › YOLO mode and Copy dictation only are read as the
+                // output commits. A dictation YOLO mode sends is pasted.
+                let sends = job.by_shortcut
+                    && !job.flavour.raw()
+                    && crate::dictation::yolo_mode::sends(application.as_deref(), None);
+                let copy_only = crate::labs::copy_only() && !sends;
+                let pasted = if copy_only || needs_manual_paste {
+                    inline.take();
+                    copy_uninserted(paster, &text)
+                } else {
+                    match inline.as_mut().map(|inline| inline.finish(&text)) {
+                        Some(Commit::Inserted) => Ok(Some(Paste::Sent)),
+                        Some(Commit::Copy) => copy_uninserted(paster, &text),
+                        Some(Commit::Uncertain) => Err(color_eyre::eyre::eyre!(
+                            "the text service did not confirm the inline commit"
+                        )),
+                        Some(Commit::Reanchor(next)) if !reprocessed => {
+                            point = Some(next);
+                            reprocessed = true;
+                            continue;
+                        }
+                        Some(Commit::Reanchor(next)) => {
+                            // A second concurrent edit invalidates this
+                            // processed output too. Copy the latest raw
+                            // suffix, or the whole result if it cannot align.
+                            inline.take();
+                            text = next.suffix(&raw_text).unwrap_or(&raw_text).to_owned();
+                            processed = crate::dictation::processor::Processed::unchanged(&text);
+                            signed = false;
+                            copy_uninserted(paster, &text)
+                        }
+                        Some(Commit::Paste) | None => paster
+                            .paste(&text, job.flavour.terminal_paste(), job.return_to, signed)
+                            .map(Some),
+                    }
+                };
+                sent = matches!(pasted, Ok(Some(Paste::Sent))) && sends;
+                let pasted = if sent {
+                    paster.press_return().map(|()| Some(Paste::Sent))
+                } else {
+                    pasted
+                };
+                copied = matches!(pasted, Ok(Some(Paste::Copied)));
+                if text.is_empty() {
+                    // With nothing left to insert, keep the recognized
+                    // dictation available in History and Paste Last.
+                    text = raw_text.trim().to_owned();
+                    processed = crate::dictation::processor::Processed::unchanged(&text);
+                }
+                // A failed paste still keeps the text for Paste Last.
+                *last_dictation
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) =
+                    Some(LastDictation::new(text.clone(), signed));
+                pasted.map_err(|error| format!("{error:#}"))?;
+            }
+            break (processed, text);
+        };
         if let Some(history) = history {
             let mut draft = crate::dictation::modes::history_draft(
                 raw_text,
@@ -182,6 +215,13 @@ pub(super) fn process_dictation_job(
     done.stop_phrase_only = stop_phrase_only;
     done.copied = copied;
     done
+}
+
+fn copy_uninserted(paster: &mut WindowsPaster, text: &str) -> Result<Option<Paste>> {
+    if text.is_empty() {
+        return Ok(None);
+    }
+    paster.copy_only(text).map(|()| Some(Paste::Copied))
 }
 
 pub(super) fn process_paste_last(

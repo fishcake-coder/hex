@@ -866,6 +866,7 @@ pub(super) const SCENES: &[Scene] = &[
         *ui = fixture(DesktopShortcuts::Registered);
         ui.platform = platform::PlatformState::preview(platform::Capabilities::WINDOWS);
         ui.host = platform::PlatformHost::Fixture(Vec::new());
+        ui.settings.labs.live_typing = true;
         ui.settings.paste_with_shift = true;
         ui.labs_open = true;
     }),

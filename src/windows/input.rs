@@ -304,7 +304,7 @@ struct CaptureState {
     locked: bool,
     second_tap: bool,
     recording: bool,
-    inline_escape: bool,
+    inline_editing: bool,
     last_release_ms: Option<u32>,
     /// When the held press that records began, from the hook's tick count:
     /// a key joining it a second or more later is the app's (Labs › Hold
@@ -351,7 +351,7 @@ impl CaptureState {
             return None;
         }
         self.active = true;
-        self.inline_escape = false;
+        self.inline_editing = false;
         let double_tapped = self
             .last_release_ms
             .take()
@@ -1067,7 +1067,7 @@ fn process_button(
             // Escape also cancels a hold when inline dictation has started.
             // Keep a captured cancel key's repeats and release with Hex.
             let inline_escape = vk == u32::from(VK_ESCAPE)
-                && state.capture.inline_escape
+                && state.capture.inline_editing
                 && state.capture.recording;
             let toggle_cancel = state.cancel_vk == Some(vk)
                 && state.capture.wants_cancel()
@@ -1175,12 +1175,13 @@ fn process_button(
             } else if !modifier_event {
                 // A key or button joining a held modifier-only shortcut makes
                 // a chord meant for another application, such as Alt+Tab,
-                // unless Labs › Hold through other keys keeps the long hold
-                // and leaves the key to the app in front.
+                // unless inline dictation has shown text to edit or Labs ›
+                // Hold through other keys keeps the long hold.
                 if is_down
                     && state.trigger_vk.is_none()
                     && state.capture.active
                     && state.capture.flavour.normal()
+                    && !state.capture.inline_editing
                     && !state
                         .capture
                         .holds_through_joining_keys(crate::labs::hold_through_keys(), time)

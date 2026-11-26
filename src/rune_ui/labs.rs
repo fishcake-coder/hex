@@ -574,20 +574,35 @@ fn rows(ui: &Ui) -> Vec<Row> {
         });
     }
     rows.push(row(Feature::Playground, Some(&SPARKLES)));
+    let windows = caps.os == super::platform::Os::Windows;
     let live_text = row(Feature::LiveText, Some(&WAVE));
     rows.push(Row {
+        title: if windows {
+            tr("Live typing")
+        } else {
+            live_text.title
+        },
         note: live_text_note(ui),
         ..live_text
     });
+    if windows {
+        let inline = row(Feature::LiveTyping, Some(&KEYBOARD));
+        rows.push(Row {
+            title: tr("Live typing in textbox"),
+            note: if inline.locked {
+                None
+            } else {
+                live_text_note(ui).or_else(|| {
+                    Some(tr("Requires the Hex Live Typing Windows input service").to_owned())
+                })
+            },
+            ..inline
+        });
+    }
     rows.push(row(Feature::FasterLiveText, None));
     rows.push(row(Feature::FailureNotices, None));
     rows.push(row(Feature::StopPhrase, None));
-    if caps.os == super::platform::Os::Windows {
-        rows.push(Row {
-            note: Some(tr("Requires the Hex Live Typing Windows input service").to_owned()),
-            ..row(Feature::LiveTyping, Some(&KEYBOARD))
-        });
-    } else if caps.os == super::platform::Os::Linux && ui.platform.wayland {
+    if caps.os == super::platform::Os::Linux && ui.platform.wayland {
         let live_typing = Row {
             about: tr("On Wayland, show your words in the text box as you speak, then Hex types the text there").into(),
             ..row(Feature::LiveTyping, Some(&KEYBOARD))

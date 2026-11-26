@@ -45,13 +45,13 @@ impl CaptureState {
 }
 
 impl WindowsHotkeyMonitor {
-    /// Let Escape cancel a physical hold that started an inline composition.
-    pub(crate) fn allow_inline_escape(&self) {
+    /// Let editing keys reach the inline field, with Escape still cancelling.
+    pub(crate) fn allow_inline_editing(&self) {
         let mut guard = CALLBACK_STATE.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(state) = guard.as_mut()
             && state.capture.recording
         {
-            state.capture.inline_escape = true;
+            state.capture.inline_editing = true;
         }
     }
 

@@ -59,7 +59,7 @@
         "windows",
         "linux"
       ],
-      "summary": "Show your words in a compatible text box as you speak and insert the finished dictation there",
+      "summary": "Show words as you speak in a compatible field on Wayland or with Live typing in textbox on Windows",
       "title": "Live typing"
     },
     {

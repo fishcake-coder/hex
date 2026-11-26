@@ -880,6 +880,9 @@ Do not start it beside an existing listener.
 
 ```ts
 Completed output                         // output
+├── Labs › Live typing in textbox (Windows, on by default, labs.live_typing) -> Windows text composition in a compatible focused field
+│   ├── Preview while speaking -> Finish replaces it with the final dictation once
+│   └── Service unavailable or no preview -> Ordinary paste (dictation.md#live-typing-labs)
 ├── Paste -> Current focus, in submission order
 │   ├── Back-to-back dictations with no key, click, or window change between
 │   │   -> joined with a space and sentence-aware capitalization (macOS, Windows;

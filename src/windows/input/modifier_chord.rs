@@ -17,7 +17,7 @@ impl CallbackState {
     pub(super) fn modifier_chord(&mut self, vk: u32, is_down: bool, time: u32) {
         // A modifier the shortcut doesn't name joining a modifier-only hold
         // is a chord meant for another application. Its press takes the hold
-        // away (Labs › Hold through other keys keeps it, as for keys), and
+        // away (inline editing and Labs › Hold through other keys keep it), and
         // Alt's release then passes through unmasked, since Hex swallowed
         // nothing the app would read as Alt alone — unless Hex later swallows
         // a key of this chord (Paste Last's V re-arms the mask).
@@ -27,6 +27,7 @@ impl CallbackState {
             self.mask_release = false;
             if self.capture.active
                 && self.capture.flavour.normal()
+                && !self.capture.inline_editing
                 && !self
                     .capture
                     .holds_through_joining_keys(crate::labs::hold_through_keys(), time)
@@ -52,7 +53,10 @@ impl CallbackState {
                 self.dirty = true;
                 send_event(self, action, time);
             }
-        } else if self.capture.active && self.capture.flavour.normal() && !self.holds(&self.binding)
+        } else if self.capture.active
+            && self.capture.flavour.normal()
+            && (!self.capture.inline_editing || (!is_down && self.binding.names_modifier(vk)))
+            && !self.holds(&self.binding)
         {
             if let Some(action) = self.capture.release(self.double_tap_enabled, time) {
                 self.dirty = self.holds_any_required(&self.binding);

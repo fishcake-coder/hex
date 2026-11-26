@@ -23,30 +23,144 @@ bool supported(LANGID language) {
     return false;
 }
 
-HRESULT register_service(ITfInputProcessorProfiles* profiles) {
+HRESULT contains_guid(IEnumGUID* entries, REFGUID expected, bool& found) {
+    if (!entries) return E_UNEXPECTED;
+    GUID entry{};
+    HRESULT status = S_OK;
+    while ((status = entries->Next(1, &entry, nullptr)) == S_OK) {
+        if (entry == expected) {
+            found = true;
+            return S_OK;
+        }
+    }
+    return FAILED(status) ? status : S_OK;
+}
+
+struct Registration {
+    bool service = false;
+    bool speech = false;
+    bool profiles[ARRAYSIZE(languages)]{};
+};
+
+HRESULT registered_profiles(ITfInputProcessorProfileMgr* manager, Registration& registration) {
+    ComPtr<IEnumTfInputProcessorProfiles> entries;
+    HRESULT status = manager->EnumProfiles(0, &entries);
+    if (FAILED(status)) return status;
+    if (!entries) return E_UNEXPECTED;
+    TF_INPUTPROCESSORPROFILE entry{};
+    while ((status = entries->Next(1, &entry, nullptr)) == S_OK) {
+        if (entry.clsid != bridge || entry.guidProfile != profile) continue;
+        for (size_t index = 0; index < ARRAYSIZE(languages); ++index) {
+            if (entry.langid == languages[index]) registration.profiles[index] = true;
+        }
+    }
+    return FAILED(status) ? status : S_OK;
+}
+
+HRESULT read_registration(ITfInputProcessorProfiles* profiles, ITfCategoryMgr* categories,
+                          Registration& registration) {
+    ComPtr<IEnumGUID> services;
+    HRESULT status = profiles->EnumInputProcessorInfo(&services);
+    if (FAILED(status)) return status;
+    status = contains_guid(services.Get(), bridge, registration.service);
+    if (FAILED(status)) return status;
+    ComPtr<IEnumGUID> speech;
+    status = categories->EnumItemsInCategory(GUID_TFCAT_TIP_SPEECH, &speech);
+    if (FAILED(status)) return status;
+    status = contains_guid(speech.Get(), bridge, registration.speech);
+    if (FAILED(status)) return status;
+    ComPtr<ITfInputProcessorProfileMgr> manager;
+    status = profiles->QueryInterface(IID_PPV_ARGS(&manager));
+    return FAILED(status) ? status : registered_profiles(manager.Get(), registration);
+}
+
+HRESULT unregister_service(ITfInputProcessorProfiles* profiles, ITfCategoryMgr* categories,
+                           const Registration& registration) {
+    HRESULT result = S_OK;
+    for (size_t index = 0; index < ARRAYSIZE(languages); ++index) {
+        if (!registration.profiles[index]) continue;
+        const HRESULT status = profiles->RemoveLanguageProfile(bridge, languages[index], profile);
+        if (FAILED(status)) result = status;
+    }
+    if (registration.speech) {
+        const HRESULT status = categories->UnregisterCategory(bridge, GUID_TFCAT_TIP_SPEECH, bridge);
+        if (FAILED(status)) result = status;
+    }
+    if (registration.service) {
+        const HRESULT status = profiles->Unregister(bridge);
+        // Unregister also removes every profile and category for this CLSID.
+        if (SUCCEEDED(status) || SUCCEEDED(result)) result = status;
+    }
+    return result;
+}
+
+HRESULT change_registration(ITfInputProcessorProfiles* profiles, bool install) {
     ComPtr<ITfCategoryMgr> categories;
     HRESULT status = CoCreateInstance(CLSID_TF_CategoryMgr, nullptr, CLSCTX_INPROC_SERVER,
                                       IID_PPV_ARGS(&categories));
     if (FAILED(status)) return status;
-    status = profiles->Register(bridge);
+    Registration existing{};
+    status = read_registration(profiles, categories.Get(), existing);
     if (FAILED(status)) return status;
+    if (!install) return unregister_service(profiles, categories.Get(), existing);
+
+    Registration added{};
+    if (!existing.service) {
+        status = profiles->Register(bridge);
+        if (FAILED(status)) return status;
+        added.service = true;
+    }
     // Speech has its own category and does not replace the keyboard profile.
-    status = categories->RegisterCategory(bridge, GUID_TFCAT_TIP_SPEECH, bridge);
+    if (!existing.speech) {
+        status = categories->RegisterCategory(bridge, GUID_TFCAT_TIP_SPEECH, bridge);
+        added.speech = SUCCEEDED(status);
+    }
     if (SUCCEEDED(status)) {
-        for (const auto language : languages) {
+        for (size_t index = 0; index < ARRAYSIZE(languages); ++index) {
+            if (existing.profiles[index]) continue;
             status = profiles->AddLanguageProfile(
-                bridge, language, profile, name, ARRAYSIZE(name) - 1, L"", 0, 0);
+                bridge, languages[index], profile, name, ARRAYSIZE(name) - 1, nullptr, 0, 0);
             if (FAILED(status)) break;
+            added.profiles[index] = true;
         }
     }
-    if (FAILED(status)) profiles->Unregister(bridge);
-    return status;
+    if (FAILED(status)) {
+        unregister_service(profiles, categories.Get(), added);
+        return status;
+    }
+    return S_OK;
 }
 
 struct SpeechProfiles {
     bool hex_active = false;
     bool other_active = false;
 };
+
+HRESULT disable_profiles(ITfInputProcessorProfiles* profiles, ITfInputProcessorProfileMgr* manager) {
+    Registration registration{};
+    HRESULT status = registered_profiles(manager, registration);
+    if (FAILED(status)) return status;
+    LANGID active_language = 0;
+    GUID active_profile{};
+    const bool active = profiles->GetActiveLanguageProfile(bridge, &active_language, &active_profile) == S_OK &&
+                        active_profile == profile;
+    HRESULT result = S_OK;
+    for (size_t index = 0; index < ARRAYSIZE(languages); ++index) {
+        if (!registration.profiles[index]) continue;
+        const auto language = languages[index];
+        if (active && language == active_language) {
+            status = manager->DeactivateProfile(TF_PROFILETYPE_INPUTPROCESSOR, language, bridge, profile,
+                                                nullptr, TF_IPPMF_FORSESSION | TF_IPPMF_DISABLEPROFILE);
+            if (FAILED(status)) result = status;
+        } else {
+            BOOL enabled = FALSE;
+            status = profiles->IsEnabledLanguageProfile(bridge, language, profile, &enabled);
+            if (status == S_OK && enabled) status = profiles->EnableLanguageProfile(bridge, language, profile, FALSE);
+            if (FAILED(status)) result = status;
+        }
+    }
+    return result;
+}
 
 HRESULT speech_profiles(ITfInputProcessorProfiles* profiles, ITfInputProcessorProfileMgr* manager,
                         LANGID language, SpeechProfiles& result) {
@@ -78,16 +192,7 @@ HRESULT user_profile(ITfInputProcessorProfiles* profiles, std::wstring_view comm
     ComPtr<ITfInputProcessorProfileMgr> manager;
     HRESULT status = profiles->QueryInterface(IID_PPV_ARGS(&manager));
     if (FAILED(status)) return status;
-    if (command == L"disable") {
-        HRESULT result = S_OK;
-        for (const auto language : languages) {
-            const HRESULT disabled = manager->DeactivateProfile(
-                TF_PROFILETYPE_INPUTPROCESSOR, language, bridge, profile, nullptr,
-                TF_IPPMF_FORSESSION | TF_IPPMF_DISABLEPROFILE);
-            if (FAILED(disabled)) result = disabled;
-        }
-        return result;
-    }
+    if (command == L"disable") return disable_profiles(profiles, manager.Get());
 
     LANGID language = 0;
     status = profiles->GetCurrentLanguage(&language);
@@ -163,12 +268,14 @@ int wmain(int argc, wchar_t** argv) {
         status = CoCreateInstance(CLSID_TF_InputProcessorProfiles, nullptr, CLSCTX_INPROC_SERVER,
                                   IID_PPV_ARGS(&profiles));
         if (SUCCEEDED(status)) {
-            if (command == L"register") status = register_service(profiles.Get());
-            else if (command == L"unregister") status = profiles->Unregister(bridge);
+            if (command == L"register" || command == L"unregister") {
+                status = change_registration(profiles.Get(), command == L"register");
+            }
             else status = user_profile(profiles.Get(), command);
         }
     }
     CoUninitialize();
+    if (command == L"status" && status == S_FALSE) return 1;
     if (status != S_OK) {
         std::fprintf(stderr, "Windows text service returned HRESULT 0x%08lx.\n",
                      static_cast<unsigned long>(status));

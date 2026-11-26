@@ -58,7 +58,8 @@ Feature             Pane  Toggle (settings.json, hex settings)   On: what it doe
 │                                        applications, corrections, OpenCode rewrite, and transformations, as the old editor
 │                                        did before Output replaced it; off, `hex window show --pane modes` opens Output
 │                                        // checks: the_modes_editor_lab_brings_modes_back_to_the_sidebar (rune_ui/tests.rs)
-├── Live text       no    labs.live_text                         provisional words beside the HUD while dictating; its card says when the selected speech model can't stream (Linux: or Speech engine is CPU), so no words would show
+├── Live text       no    labs.live_text                         provisional words beside the HUD while dictating (titled Live typing on Windows); its card says when the selected speech model can't stream (Linux: or Speech engine is CPU)
+├── Live typing in textbox no labs.live_typing                    (Windows, on by default) provisional words and final dictation inside a compatible focused field; requires the Hex Live Typing text service and a streaming model for the preview
 ├── Faster live text no    labs.faster_live_text                 live words sooner, and the final text from the same shorter
 │                                        lookahead for Parakeet buffered streaming, chosen from the model's own menus
 │                                        (Unified English 70/7/7: 1.12 s instead of 2.08 s), at about 1.6 times the
@@ -68,7 +69,7 @@ Feature             Pane  Toggle (settings.json, hex settings)   On: what it doe
 │                                        shortcut were pressed again, and the phrase never reaches the pasted text;
 │                                        needs a speech model that streams on a GPU, as Live text does
 ├── Failure notices no    labs.failure_notices                   when a dictation fails, its explanation sits beside the HUD for about 6 s, or until the next capture starts
-├── Live typing     no    labs.live_typing                       (Windows and Linux Wayland) provisional words inside a compatible focused field with the final text committed there; requires the Hex text service on Windows and a Wayland input method on Linux
+├── Live typing     no    labs.live_typing                       (Linux Wayland, off by default) provisional words inside a compatible focused field with final text committed there; requires the Wayland input method
 ├── Appearance      no    labs.appearance + labs.appearance_theme (system/light/dark, default system)  the main window is forced light or dark instead of following the system; the dictation HUD (including its onboarding and Sounds previews) and meeting recording pill remain dark. Other overlays follow the OS. On Windows the title bar follows too, through its background and light/dark mode; Windows 10 has no caption colour, so DWM keeps its own light or dark caption background (builds before 19041 keep the OS caption) while its text and buttons follow
 ├── Live chapters   no    labs.live_chapters           (macOS)   chapters a meeting while it records, boundary pass after Stop
 ├── Words on screen no labs.screen_vocabulary         (macOS)   names and terms in the focused window become temporary vocabulary for each dictation; read locally through Accessibility, never saved, password fields skipped
@@ -469,8 +470,10 @@ plate turned on after launch never flashes the last dictation's words,
 #1075; elsewhere only when Live text is on at launch);
 the window always attaches the playground with Rune's own ⇧⌘D off, and its
 sidebar item, ⇧⌘D, the macOS View menu, and story links open it only while
-the toggle is on. Live typing is read at the hold threshold (or the Toggle
-press). Live chapters are read when a recording starts. Nothing
+the toggle is on. On Windows, Live typing in textbox reads the switch and captures
+the focused field when the shortcut is pressed. On Wayland, Live typing reads
+its switch at the hold threshold or the Toggle press. Live chapters are read
+when a recording starts. Nothing
 starts at launch for a feature that is off. Limit: the macOS window's fixed
 size is chosen when it is created, so it becomes resizable for the
 playground only after Hex restarts.

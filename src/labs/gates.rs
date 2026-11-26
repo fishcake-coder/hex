@@ -21,10 +21,9 @@ pub fn failure_notices() -> bool {
     on(FAILURE_NOTICES) && Feature::FailureNotices.on_this_os()
 }
 
-/// Live typing: provisional words in the focused text field as an
-/// input-method preedit on Wayland, and the final text typed there instead of
-/// pasted (Linux; read as each hotkey capture starts).
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+/// Live typing: provisional words in the focused text field through Windows
+/// TSF or a Wayland input method, read as each hotkey capture starts.
+#[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
 pub fn live_typing() -> bool {
     on(LIVE_TYPING) && Feature::LiveTyping.on_this_os()
 }

@@ -29,7 +29,7 @@ mod output;
 mod shortcuts;
 
 use finish::submit_capture;
-use live_typing::LiveTyping;
+use live_typing::{Focus, LiveTyping};
 use output::{process_dictation_job, process_paste_last};
 use shortcuts::{Shortcuts, next_action};
 
@@ -378,7 +378,7 @@ pub fn run(
     // if the desktop or a taskbar is in front instead.
     let mut recording_return_to = None;
     let mut recording_inline = None::<LiveTyping>;
-    let mut tried_live_typing = false;
+    let mut recording_inline_focus = None;
     let mut recording_feedback_started = false;
     // Whether this capture's start tone already played on its press.
     let mut start_tone_played = false;
@@ -741,9 +741,20 @@ pub fn run(
                 // the press asks for the microphone now.
                 HotkeyAction::Start if !recording && !start_pending => {
                     recording_inline.take();
-                    tried_live_typing = false;
                     recording_flavour = flavour;
                     recording_by_shortcut = !deliberate;
+                    // Let a prerecorded fixture exercise the same Windows
+                    // text service through the listener's local controls.
+                    recording_inline_focus = if (recording_by_shortcut
+                        || crate::audio::uses_fixture())
+                        && crate::labs::live_typing()
+                        && !crate::labs::copy_only()
+                        && !flavour.terminal_paste()
+                    {
+                        Focus::current()
+                    } else {
+                        None
+                    };
                     // The window in front now, where a paste returns if the
                     // desktop or a taskbar is in front when it is sent.
                     recording_return_to = crate::windows::paste::CaptureWindow::read();
@@ -1096,18 +1107,14 @@ pub fn run(
                     // Short taps and shortcut chords never reach the model;
                     // the stream starts with the backlog once the hold counts.
                     if recording_feedback_started {
-                        if !tried_live_typing {
-                            tried_live_typing = true;
-                            if recording_by_shortcut
-                                && crate::labs::live_typing()
-                                && !crate::labs::copy_only()
-                                && !recording_flavour.terminal_paste()
-                            {
-                                recording_inline = LiveTyping::begin();
-                                if recording_inline.is_some() {
-                                    hotkey.allow_inline_escape();
-                                }
-                            }
+                        if let Some(focus) = recording_inline_focus.take() {
+                            recording_inline = LiveTyping::begin(focus);
+                        }
+                        if recording_inline
+                            .as_ref()
+                            .is_some_and(LiveTyping::take_first_preview)
+                        {
+                            hotkey.allow_inline_editing();
                         }
                         capture.begin_stream(&engine);
                     }

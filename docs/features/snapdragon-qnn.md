@@ -137,12 +137,9 @@ and can consume NPU memory alongside the listener.
 
 ## Typing inside the focused field
 
-Windows **Live typing** uses a native Windows Text Services Framework
-speech profile. Build the native text service, run its `Register` action
-from an elevated PowerShell, then run `Enable` from your regular user
-session. Enable **Live typing** in Hex's Labs. Registration installs the
-text service under Program Files. The speech profile is separate from
-the keyboard profile.
+**Live typing in textbox** is on by default. Register and enable its Windows
+text service with the commands below. Hex keeps an explicitly saved Labs
+preference when you upgrade.
 
 ```powershell
 & '.\scripts\windows-live-typing\build.ps1'
@@ -154,9 +151,10 @@ the keyboard profile.
 ```
 
 A supported focused field displays the provisional transcript while the
-same Snapdragon worker runs recognition. Release commits the processed
-dictation once. Cancel clears the composition. The Windows service
-manages these edits and never receives the microphone audio. Use
+same Snapdragon worker runs recognition. In Toggle mode, you can edit or
+move the caret mid-dictation and continue speaking there. Stopping commits
+the latest span. Escape clears the current preview and leaves your edits.
+The Windows text service receives transcript text and no microphone audio. Use
 `-Action Disable` from your regular user session to deactivate the speech
 profile and `-Action Unregister` from an elevated PowerShell to remove its
 registration.

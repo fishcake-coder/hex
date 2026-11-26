@@ -24,7 +24,7 @@ impl Feature {
             }
             #[cfg(target_os = "windows")]
             Self::LiveTyping => {
-                "Show your words in supported text boxes as you speak (requires the Hex Live Typing text service)"
+                "Live typing in textbox: show words as you speak in supported text boxes (requires the Hex Live Typing text service)"
             }
             #[cfg(not(target_os = "windows"))]
             Self::LiveTyping => {

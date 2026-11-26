@@ -100,7 +100,7 @@ impl AppearanceTheme {
     }
 }
 
-/// The `labs` switches (`crate::labs`), each off by default; older Labs features keep their own keys, and retired switches (`labs.enabled`, `labs.collapsible_meeting_sections`, `labs.meeting_platform_icons`, `labs.transcribe_files`, `labs.restore_shortcut_default`, `labs.yearly_stats`, and the graduated meeting labs) are ignored.
+/// The `labs` switches (`crate::labs`). Older Labs features keep their own keys, and retired switches (`labs.enabled`, `labs.collapsible_meeting_sections`, `labs.meeting_platform_icons`, `labs.transcribe_files`, `labs.restore_shortcut_default`, `labs.yearly_stats`, and the graduated meeting labs) are ignored.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
 pub struct LabsSettings {
@@ -111,8 +111,8 @@ pub struct LabsSettings {
     pub faster_live_text: bool,
     /// A failed dictation's explanation beside the HUD for a few seconds.
     pub failure_notices: bool,
-    /// Provisional words in the focused text field as a Wayland input-method
-    /// preedit, with the final text committed there (Linux Wayland).
+    /// Provisional words in a focused field using Windows TSF or a Wayland
+    /// input method. Windows defaults to on when the setting is missing.
     pub live_typing: bool,
     pub live_chapters: bool,
     pub playground: bool,
@@ -444,7 +444,7 @@ impl Default for LabsSettings {
             live_text: false,
             faster_live_text: false,
             failure_notices: false,
-            live_typing: false,
+            live_typing: cfg!(target_os = "windows"),
             live_chapters: false,
             playground: false,
             screen_vocabulary: false,

@@ -1201,20 +1201,36 @@ not run on GNOME).
 
 ### Live Typing (Labs)
 
-On Windows, enable **Live typing** with the Hex Live Typing text service
-available in the focused app. A physical dictation shortcut opens a text
-composition in a compatible field. It receives the latest provisional
-transcript as recognition progresses. Releasing the shortcut commits
-the processed result once. Escape cancels the recording and clears its
-preview. Focus changes and abandoned output also end the composition.
-If the field changes before commit, Hex can put
-the result on the clipboard for manual paste. A field without a text
-service uses the standard Windows paste path.
+#### Windows
+
+**Settings › Labs › Live typing in textbox** is on when no preference is
+saved. It uses the Hex Live Typing text service with a streaming speech model.
+The adjacent **Live typing** card controls the floating transcript by the
+recording indicator, and its separate preference is off by default.
+
+```ts
+Dictation shortcut -> Remember the focused field before recording is intentional   // labs.live-typing
+├── Compatible field with the text service -> Show the latest provisional words inside the field
+│   ├── Release or finish -> Replace the preview with the processed dictation once
+│   ├── Edit or move the caret in the same field -> Keep the existing text and continue at the new caret
+│   ├── Escape during the preview -> Cancel the recording and clear the current unedited preview
+│   └── Focus lost during composition -> Clear the preview and copy the result for manual paste
+└── Text service unavailable, or no provisional words shown -> Use the usual Windows paste path
+```
+
+Toggle mode lets you type with the shortcut keys released. When you edit
+or move the caret, Hex hands the previous preview to the editor. It waits
+while text remains selected and places subsequent words at a collapsed
+caret. Final output processing applies to the latest dictated span. Escape
+preserves earlier text you edited or moved away from.
 
 The Windows listener hands changed previews to an event-driven worker
 with one pending preview. That worker sends the text to the target app's
 own Windows text service while audio capture continues on the listener.
-The encoder and decoder stay on the selected speech device.
+The encoder and decoder stay on the selected speech device. If Windows
+cannot confirm the final edit, the job retains the result in Paste Last
+and reports the failure before attempting another insertion. Terminal
+Paste Shortcut and Copy dictation only use their usual output paths.
 
 #### Linux Wayland
 

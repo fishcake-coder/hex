@@ -22,8 +22,8 @@ constexpr wchar_t kWindowClass[] = L"HexLiveTyping.Tsf";
 constexpr UINT kCancelInactive = WM_APP + 1;
 constexpr DWORD kMaxTextBytes = 16 * 1024;
 
-enum class Operation : ULONG_PTR { begin = 1, update, commit, cancel };
-enum class Outcome : LRESULT { declined = 0, applied = 1, uncertain = 2 };
+enum class Operation : ULONG_PTR { begin = 1, update, commit, cancel, probe };
+enum class Outcome : LRESULT { declined = 0, applied, uncertain, reanchor, selection_pending };
 
 HMODULE module = nullptr;
 std::atomic<long> live_objects{0};
@@ -61,7 +61,7 @@ bool same_position(ITfRange* first, ITfRange* second, TfEditCookie cookie, TfAnc
     return SUCCEEDED(first->CompareStart(cookie, second, anchor, &comparison)) && comparison == 0;
 }
 
-ComPtr<ITfRange> collapsed_selection(ITfContext* context, TfEditCookie cookie) {
+ComPtr<ITfRange> current_selection(ITfContext* context, TfEditCookie cookie) {
     ComPtr<ITfRange> range;
     TF_SELECTION selection{};
     ULONG count = 0;
@@ -69,9 +69,47 @@ ComPtr<ITfRange> collapsed_selection(ITfContext* context, TfEditCookie cookie) {
         return range;
     }
     range.Attach(selection.range);
-    BOOL empty = FALSE;
-    if (!range || FAILED(range->IsEmpty(cookie, &empty)) || !empty) range.Reset();
     return range;
+}
+
+wchar_t beside_caret(ITfRange* caret, TfEditCookie cookie, bool before) {
+    ComPtr<ITfRange> range;
+    if (FAILED(caret->Clone(&range)) || !range) return L'\0';
+    LONG shifted = 0;
+    const HRESULT result = before ? range->ShiftStart(cookie, -1, &shifted, nullptr)
+                                  : range->ShiftEnd(cookie, 1, &shifted, nullptr);
+    wchar_t character = L'\0';
+    ULONG count = 0;
+    return SUCCEEDED(result) && shifted &&
+        SUCCEEDED(range->GetText(cookie, 0, &character, 1, &count)) && count == 1 ? character : L'\0';
+}
+
+bool spaced_letter(wchar_t character) {
+    // Avoid introducing spaces in scripts that commonly run words together.
+    if ((character >= 0x0e00 && character <= 0x109f) || // Thai, Lao, Myanmar and Tibetan
+        (character >= 0x1780 && character <= 0x17ff)) return false; // Khmer
+    WORD type = 0;
+    WORD script = 0;
+    return GetStringTypeW(CT_CTYPE1, &character, 1, &type) && (type & (C1_ALPHA | C1_DIGIT)) &&
+        GetStringTypeW(CT_CTYPE3, &character, 1, &script) &&
+        !(script & (C3_IDEOGRAPH | C3_HIRAGANA | C3_KATAKANA));
+}
+
+bool permits_space_after(wchar_t character) {
+    switch (character) {
+        case L'.':
+        case L',':
+        case L'!':
+        case L'?':
+        case L';':
+        case L':':
+        case L')':
+        case L']':
+        case L'}':
+            return true;
+        default:
+            return spaced_letter(character);
+    }
 }
 
 bool input_scope_allows_preview(ITfContext* context, ITfRange* range, TfEditCookie cookie, HWND window) {
@@ -150,7 +188,8 @@ private:
 };
 
 class Bridge final : public ITfTextInputProcessor, public ITfCompositionSink,
-                     public ITfThreadMgrEventSink, public ITfThreadFocusSink {
+                     public ITfThreadMgrEventSink, public ITfThreadFocusSink,
+                     public ITfTextEditSink {
 public:
     Bridge() { ++live_objects; }
 
@@ -165,6 +204,8 @@ public:
             *result = static_cast<ITfThreadMgrEventSink*>(this);
         } else if (id == __uuidof(ITfThreadFocusSink)) {
             *result = static_cast<ITfThreadFocusSink*>(this);
+        } else if (id == __uuidof(ITfTextEditSink)) {
+            *result = static_cast<ITfTextEditSink*>(this);
         } else {
             return E_NOINTERFACE;
         }
@@ -249,18 +290,43 @@ public:
         return S_OK;
     }
 
+    HRESULT STDMETHODCALLTYPE OnEndEdit(ITfContext* context, TfEditCookie, ITfEditRecord* edit) override {
+        if ((!anchor_ && !composition_) || in_request_ || external_edit_ || !edit ||
+            !same_object(context_.Get(), context)) return S_OK;
+        BOOL own_session = FALSE;
+        if (SUCCEEDED(context->InWriteSession(client_, &own_session)) && own_session) return S_OK;
+
+        BOOL selection_changed = FALSE;
+        if (SUCCEEDED(edit->GetSelectionStatus(&selection_changed)) && selection_changed) {
+            external_edit_ = true;
+        } else {
+            ComPtr<IEnumTfRanges> changes;
+            ComPtr<ITfRange> changed;
+            ULONG count = 0;
+            external_edit_ = SUCCEEDED(edit->GetTextAndPropertyUpdates(TF_GTP_INCL_TEXT, nullptr, 0, &changes)) &&
+                changes && SUCCEEDED(changes->Next(1, &changed, &count)) && count != 0;
+        }
+        return S_OK;
+    }
+
     HRESULT STDMETHODCALLTYPE OnCompositionTerminated(TfEditCookie cookie, ITfComposition* composition) override {
         if (ending_composition_ || !composition_ || !same_object(composition_.Get(), composition)) return S_OK;
-        try {
+        if (!external_edit_ && (focus_lost_ || !still_focused())) {
+            const auto id = capture_id_;
             ComPtr<ITfRange> range;
-            if (FAILED(composition_->GetRange(&range)) || !range || !same_text(range.Get(), cookie, preview_) ||
-                FAILED(range->SetText(cookie, 0, L"", 0))) {
-                uncertain_id_ = capture_id_;
+            try {
+                if (FAILED(composition->GetRange(&range)) || !range || !same_text(range.Get(), cookie, preview_) ||
+                    FAILED(range->SetText(cookie, 0, L"", 0))) uncertain_id_ = id;
+            } catch (...) {
+                uncertain_id_ = id;
             }
-        } catch (...) {
-            uncertain_id_ = capture_id_;
+            clear_capture();
+            return S_OK;
         }
-        clear_capture();
+        // An editor can terminate the composition as part of the user's edit.
+        // The text now belongs to the editor, including any replacements.
+        external_edit_ = true;
+        composition_.Reset();
         return S_OK;
     }
 
@@ -268,45 +334,73 @@ public:
         if (id != capture_id_) return Outcome::declined;
         if (operation == Operation::cancel) return cancel(cookie);
         if (focus_lost_ || !still_focused()) return failure();
-        if (operation == Operation::begin) {
-            anchor_ = collapsed_selection(context_.Get(), cookie);
-            if (anchor_ && input_scope_allows_preview(context_.Get(), anchor_.Get(), cookie, target_window_)) {
-                return Outcome::applied;
-            }
-            return Outcome::declined;
-        }
-
-        ComPtr<ITfRange> selection = collapsed_selection(context_.Get(), cookie);
-        if (!selection || !input_scope_allows_preview(context_.Get(), selection.Get(), cookie, target_window_)) {
+        ComPtr<ITfRange> selection = current_selection(context_.Get(), cookie);
+        BOOL collapsed = FALSE;
+        if (!selection || FAILED(selection->IsEmpty(cookie, &collapsed)) ||
+            !input_scope_allows_preview(context_.Get(), selection.Get(), cookie, target_window_)) {
             return failure();
         }
+        if (operation == Operation::begin) {
+            if (!collapsed) return Outcome::declined;
+            anchor_ = selection;
+            return Outcome::applied;
+        }
+        if (external_edit_) return accept_external_edit(cookie);
+
         ComPtr<ITfRange> range;
-        std::wstring next_preview(text);
+        // Some text stores perform ordinary edits outside a TSF edit session.
+        // Verify the text and caret again even when the sink saw no changes.
+        if (composition_) {
+            if (FAILED(composition_->GetRange(&range)) || !range) return failure();
+            if (!collapsed || !same_position(selection.Get(), range.Get(), cookie, TF_ANCHOR_END) ||
+                !same_text(range.Get(), cookie, preview_)) return accept_external_edit(cookie);
+        } else if (anchor_ && (!collapsed || !same_position(selection.Get(), anchor_.Get(), cookie, TF_ANCHOR_START))) {
+            return accept_external_edit(cookie);
+        }
+
+        if (operation == Operation::commit && text.empty() && !composition_) {
+            clear_capture();
+            return Outcome::applied;
+        }
+        if (!collapsed) return Outcome::selection_pending;
+
         if (!composition_) {
-            if (!anchor_ || !same_position(selection.Get(), anchor_.Get(), cookie, TF_ANCHOR_START)) {
-                return Outcome::declined;
-            }
             ComPtr<ITfContextComposition> composition_api;
             ComPtr<IEnumITfCompositionView> compositions;
             ComPtr<ITfCompositionView> other;
             ULONG count = 0;
             if (FAILED(context_.As(&composition_api)) ||
                 FAILED(composition_api->EnumCompositions(&compositions)) || !compositions ||
-                FAILED(compositions->Next(1, &other, &count)) || count != 0 ||
-                FAILED(composition_api->StartComposition(cookie, anchor_.Get(), this, &composition_)) ||
-                !composition_) {
-                return Outcome::declined;
+                FAILED(compositions->Next(1, &other, &count))) return failure();
+            if (count != 0) return Outcome::selection_pending;
+            if (operation == Operation::probe || text.empty()) return Outcome::applied;
+            if (!anchor_) {
+                left_neighbor_ = beside_caret(selection.Get(), cookie, true);
+                right_neighbor_ = beside_caret(selection.Get(), cookie, false);
             }
+            anchor_ = selection;
+            if (FAILED(composition_api->StartComposition(cookie, anchor_.Get(), this, &composition_)) ||
+                !composition_ || FAILED(composition_->GetRange(&range)) || !range ||
+                !same_text(range.Get(), cookie, preview_) ||
+                !same_position(selection.Get(), range.Get(), cookie, TF_ANCHOR_END)) return failure();
         }
-        if (FAILED(composition_->GetRange(&range)) || !range || !same_text(range.Get(), cookie, preview_) ||
-            !same_position(selection.Get(), range.Get(), cookie, TF_ANCHOR_END)) {
-            return failure();
+        if (operation == Operation::probe) return Outcome::applied;
+        if (focus_lost_ || !still_focused()) return failure();
+
+        std::wstring next_preview(text);
+        if (!text.empty()) {
+            if (permits_space_after(left_neighbor_) && spaced_letter(text.front())) {
+                next_preview.insert(next_preview.begin(), L' ');
+            }
+            if (spaced_letter(right_neighbor_) && permits_space_after(text.back())) {
+                next_preview.push_back(L' ');
+            }
         }
 
         // Once SetText is called, a failed document callback may have applied
         // part of the transaction. Preserve that distinction for the caller.
         ComPtr<ITfComposition> owned = composition_;
-        if (FAILED(range->SetText(cookie, 0, text.data(), static_cast<LONG>(text.size()))) ||
+        if (FAILED(range->SetText(cookie, 0, next_preview.data(), static_cast<LONG>(next_preview.size()))) ||
             capture_id_ != id || !same_object(owned.Get(), composition_.Get())) {
             uncertain_id_ = id;
             return Outcome::uncertain;
@@ -397,12 +491,14 @@ private:
         if (!copy || !copy->lpData || copy->cbData < sizeof(std::uint64_t) ||
             copy->cbData > sizeof(std::uint64_t) + kMaxTextBytes || (copy->cbData % 2) != 0 ||
             copy->dwData < static_cast<ULONG_PTR>(Operation::begin) ||
-            copy->dwData > static_cast<ULONG_PTR>(Operation::cancel)) {
+            copy->dwData > static_cast<ULONG_PTR>(Operation::probe)) {
             return Outcome::declined;
         }
         const auto op = static_cast<Operation>(copy->dwData);
         const size_t characters = (copy->cbData - sizeof(std::uint64_t)) / sizeof(wchar_t);
-        if ((op == Operation::begin || op == Operation::cancel) && characters) return Outcome::declined;
+        if ((op == Operation::begin || op == Operation::cancel || op == Operation::probe) && characters) {
+            return Outcome::declined;
+        }
         std::uint64_t id = 0;
         std::memcpy(&id, copy->lpData, sizeof(id));
         if (!id) return Outcome::declined;
@@ -448,6 +544,10 @@ private:
                 return Outcome::declined;
             }
             capture_id_ = id;
+            if (SUCCEEDED(context_.As(&edit_source_))) {
+                edit_source_->AdviseSink(__uuidof(ITfTextEditSink), static_cast<ITfTextEditSink*>(this),
+                    &edit_cookie_);
+            }
         } else if (id != capture_id_) {
             return id == uncertain_id_ ? Outcome::uncertain : Outcome::declined;
         } else if (operation != Operation::cancel && (focus_lost_ || !still_focused())) {
@@ -492,21 +592,46 @@ private:
         return SUCCEEDED(ended);
     }
 
+    Outcome accept_external_edit(TfEditCookie cookie) {
+        external_edit_ = true;
+        if (!end_composition(cookie)) {
+            uncertain_id_ = capture_id_;
+            return Outcome::uncertain;
+        }
+        composition_.Reset();
+        anchor_.Reset();
+        preview_.clear();
+        left_neighbor_ = right_neighbor_ = L'\0';
+        external_edit_ = false;
+        return Outcome::reanchor;
+    }
+
     Outcome cancel(TfEditCookie cookie) {
         if (!composition_) {
             clear_capture();
             return Outcome::applied;
         }
-        const std::uint64_t id = capture_id_;
         ComPtr<ITfRange> range;
-        const bool owned = SUCCEEDED(composition_->GetRange(&range)) && range &&
+        const bool owned = !external_edit_ && SUCCEEDED(composition_->GetRange(&range)) && range &&
             same_text(range.Get(), cookie, preview_);
         ComPtr<ITfRange> selection;
-        if (owned && !focus_lost_ && still_focused()) {
-            selection = collapsed_selection(context_.Get(), cookie);
+        const bool focused = !focus_lost_ && still_focused();
+        BOOL collapsed = FALSE;
+        if (owned && focused) {
+            selection = current_selection(context_.Get(), cookie);
         }
-        const bool restore = selection && same_position(selection.Get(), range.Get(), cookie, TF_ANCHOR_END);
-        if (!owned || FAILED(range->SetText(cookie, 0, L"", 0)) || capture_id_ != id) {
+        const bool restore = selection && SUCCEEDED(selection->IsEmpty(cookie, &collapsed)) && collapsed &&
+            same_position(selection.Get(), range.Get(), cookie, TF_ANCHOR_END);
+        if (!owned || (focused && !restore)) {
+            const Outcome accepted = accept_external_edit(cookie);
+            if (accepted != Outcome::reanchor) return accepted;
+            clear_capture();
+            return Outcome::applied;
+        }
+        const std::uint64_t id = capture_id_;
+        ComPtr<ITfComposition> composition = composition_;
+        if (FAILED(range->SetText(cookie, 0, L"", 0)) || capture_id_ != id ||
+            !same_object(composition.Get(), composition_.Get())) {
             uncertain_id_ = id;
             if (end_composition(cookie)) clear_capture();
             return Outcome::uncertain;
@@ -522,6 +647,9 @@ private:
     }
 
     void clear_capture() {
+        if (edit_source_ && edit_cookie_ != TF_INVALID_COOKIE) edit_source_->UnadviseSink(edit_cookie_);
+        edit_cookie_ = TF_INVALID_COOKIE;
+        edit_source_.Reset();
         composition_.Reset();
         anchor_.Reset();
         context_.Reset();
@@ -529,7 +657,9 @@ private:
         target_window_ = nullptr;
         capture_id_ = 0;
         focus_lost_ = false;
+        external_edit_ = false;
         preview_.clear();
+        left_neighbor_ = right_neighbor_ = L'\0';
     }
 
     std::atomic<ULONG> references_{1};
@@ -542,12 +672,17 @@ private:
     HWND target_window_ = nullptr;
     ComPtr<ITfDocumentMgr> document_;
     ComPtr<ITfContext> context_;
+    ComPtr<ITfSource> edit_source_;
+    DWORD edit_cookie_ = TF_INVALID_COOKIE;
     ComPtr<ITfRange> anchor_;
     ComPtr<ITfComposition> composition_;
     std::wstring preview_;
+    wchar_t left_neighbor_ = L'\0';
+    wchar_t right_neighbor_ = L'\0';
     std::uint64_t capture_id_ = 0;
     std::uint64_t uncertain_id_ = 0;
     bool focus_lost_ = false;
+    bool external_edit_ = false;
     bool in_request_ = false;
     bool ending_composition_ = false;
 };

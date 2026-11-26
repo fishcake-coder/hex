@@ -1730,12 +1730,13 @@ mod tests {
     #[test]
     fn failure_notices_is_its_own_bit_and_off_by_default() {
         let mut labs = LabsSettings::default();
-        assert_eq!(encode_where(&labs, |_| true) & FAILURE_NOTICES, 0);
+        let initial = encode_where(&labs, |_| true);
+        assert_eq!(initial & FAILURE_NOTICES, 0);
         labs.failure_notices = true;
         labs.unload_idle_minutes = 24 * 60;
         let state = encode_where(&labs, |_| true);
         assert_ne!(state & FAILURE_NOTICES, 0);
-        assert_eq!(state & LIVE_TYPING, 0);
+        assert_eq!(state & LIVE_TYPING, initial & LIVE_TYPING);
         assert_eq!((state >> MINUTES_SHIFT) & MINUTES_MASK, 24 * 60);
     }
 

@@ -1,5 +1,6 @@
 //! Delivers the latest provisional transcript to the focused Windows text service.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -21,34 +22,46 @@ const BEGIN: usize = 1;
 const UPDATE: usize = 2;
 const COMMIT: usize = 3;
 const CANCEL: usize = 4;
+const PROBE: usize = 5;
+const REQUEST_TIMEOUT: Duration = Duration::from_millis(240);
+const SELECTION_RECHECK: Duration = Duration::from_millis(120);
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-struct Focus {
+pub(super) struct Focus {
     window: isize,
     control: isize,
     thread: u32,
+    process: u32,
 }
 
 impl Focus {
-    fn current() -> Option<Self> {
+    pub(super) fn current() -> Option<Self> {
         let mut info = GUITHREADINFO {
             cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
             ..Default::default()
         };
         // SAFETY: these calls only read the foreground GUI thread and its focus.
         let window = unsafe { GetForegroundWindow() };
-        if window.is_null()
-            || unsafe { GetGUIThreadInfo(0, &mut info) } == 0
+        if window.is_null() {
+            return None;
+        }
+        let foreground_thread = unsafe { GetWindowThreadProcessId(window, std::ptr::null_mut()) };
+        if foreground_thread == 0
+            || unsafe { GetGUIThreadInfo(foreground_thread, &mut info) } == 0
             || info.hwndFocus.is_null()
         {
             return None;
         }
-        let thread = unsafe { GetWindowThreadProcessId(info.hwndFocus, std::ptr::null_mut()) };
-        (thread != 0 && unsafe { GetForegroundWindow() } == window).then_some(Self {
-            window: window as isize,
-            control: info.hwndFocus as isize,
-            thread,
-        })
+        let mut process = 0;
+        let thread = unsafe { GetWindowThreadProcessId(info.hwndFocus, &mut process) };
+        (thread != 0 && process != 0 && unsafe { GetForegroundWindow() } == window).then_some(
+            Self {
+                window: window as isize,
+                control: info.hwndFocus as isize,
+                thread,
+                process,
+            },
+        )
     }
 
     fn bridge(self) -> Option<isize> {
@@ -60,7 +73,9 @@ impl Focus {
             if after.is_null() {
                 return None;
             }
-            if unsafe { GetWindowThreadProcessId(after, std::ptr::null_mut()) } == self.thread {
+            let mut process = 0;
+            let thread = unsafe { GetWindowThreadProcessId(after, &mut process) };
+            if thread == self.thread && process == self.process {
                 return Some(after as isize);
             }
         }
@@ -72,6 +87,8 @@ enum Response {
     Declined,
     Applied,
     Uncertain,
+    Reanchor,
+    SelectionPending,
 }
 
 fn send(window: isize, capture: u64, operation: usize, text: &str) -> Response {
@@ -108,19 +125,63 @@ fn send(window: isize, capture: u64, operation: usize, text: &str) -> Response {
     match result {
         0 => Response::Declined,
         1 => Response::Applied,
+        3 => Response::Reanchor,
+        4 => Response::SelectionPending,
         _ => Response::Uncertain,
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Commit {
     Inserted,
     Paste,
     Copy,
     Uncertain,
+    Reanchor(EditPoint),
 }
 
-enum End {
+/// The model's complete hypothesis when the editor accepted the preceding
+/// span. The editor owns that span from then on, including manual changes.
+#[derive(Clone, Default)]
+pub(super) struct EditPoint(Option<String>);
+
+impl EditPoint {
+    pub(super) fn suffix<'a>(&self, text: &'a str) -> Option<&'a str> {
+        let text = text.trim();
+        let Some(prefix) = self.0.as_deref().filter(|prefix| !prefix.is_empty()) else {
+            return Some(text);
+        };
+        if let Some(rest) = text.strip_prefix(prefix) {
+            // A streaming decoder can emit more pieces of the last word
+            // after the editor accepts it. That word stays at its old caret.
+            return Some(if rest.starts_with(char::is_whitespace) {
+                rest.trim_start()
+            } else {
+                rest.find(char::is_whitespace)
+                    .map_or("", |index| rest[index..].trim_start())
+            });
+        }
+
+        // A whole-clip fallback can change casing, punctuation or spacing.
+        // Require the same leading words before using any of its suffix.
+        let mut rest = text;
+        for old in prefix.split_whitespace() {
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            let (word, after) = rest.split_at(end);
+            if word != old {
+                let old = old.trim_matches(|c: char| !c.is_alphanumeric());
+                let word = word.trim_matches(|c: char| !c.is_alphanumeric());
+                if old.is_empty() || old.to_lowercase() != word.to_lowercase() {
+                    return None;
+                }
+            }
+            rest = after.trim_start();
+        }
+        Some(rest)
+    }
+}
+
+enum Request {
+    Prepare(Instant, SyncSender<EditPoint>),
     Commit(String, Instant, SyncSender<Commit>),
     Cancel,
 }
@@ -128,23 +189,24 @@ enum End {
 #[derive(Default)]
 struct Pending {
     preview: Option<String>,
-    end: Option<End>,
+    request: Option<Request>,
 }
 
 #[derive(Default)]
 struct Mailbox {
     pending: Mutex<Pending>,
     changed: Condvar,
+    first_preview: AtomicBool,
 }
 
 impl Mailbox {
-    fn end(&self, end: End) {
+    fn request(&self, request: Request) {
         let mut pending = self
             .pending
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         pending.preview = None;
-        pending.end = Some(end);
+        pending.request = Some(request);
         self.changed.notify_one();
     }
 }
@@ -156,12 +218,14 @@ pub(super) struct LiveTyping {
 }
 
 impl LiveTyping {
-    pub(super) fn begin() -> Option<Self> {
-        let focus = Focus::current()?;
+    pub(super) fn begin(focus: Focus) -> Option<Self> {
+        if Focus::current() != Some(focus) {
+            return None;
+        }
         let window = focus.bridge()?;
         let mut id = [0; 8];
         getrandom::fill(&mut id).ok()?;
-        let id = u64::from_le_bytes(id);
+        let id = u64::from_le_bytes(id).max(1);
         let mailbox = Arc::new(Mailbox::default());
         let worker = mailbox.clone();
         std::thread::Builder::new()
@@ -176,115 +240,261 @@ impl LiveTyping {
     }
 
     pub(super) fn preview(&self, partial: &Partial) {
+        let words = format!("{} {}", partial.stable, partial.tentative);
+        let words = words.trim();
         let mut pending = self
             .mailbox
             .pending
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if pending.end.is_none() {
-            pending.preview = Some(
-                format!("{} {}", partial.stable, partial.tentative)
-                    .trim()
-                    .to_owned(),
-            );
+        if pending.request.is_none() && pending.preview.as_deref() != Some(words) {
+            pending.preview = Some(words.to_owned());
             self.mailbox.changed.notify_one();
         }
+    }
+
+    pub(super) fn take_first_preview(&self) -> bool {
+        self.mailbox.first_preview.swap(false, Ordering::AcqRel)
     }
 
     pub(super) fn release(&mut self) {
         self.demand.take();
     }
 
-    pub(super) fn finish(mut self, text: &str) -> Commit {
+    pub(super) fn prepare(&self) -> Option<EditPoint> {
         let (reply, outcome) = mpsc::sync_channel(1);
-        let timeout = Duration::from_millis(240);
-        self.mailbox.end(End::Commit(
+        self.mailbox
+            .request(Request::Prepare(Instant::now() + REQUEST_TIMEOUT, reply));
+        outcome.recv_timeout(REQUEST_TIMEOUT).ok()
+    }
+
+    pub(super) fn finish(&mut self, text: &str) -> Commit {
+        let (reply, outcome) = mpsc::sync_channel(1);
+        self.mailbox.request(Request::Commit(
             text.to_owned(),
-            Instant::now() + timeout,
+            Instant::now() + REQUEST_TIMEOUT,
             reply,
         ));
-        self.ended = true;
-        outcome.recv_timeout(timeout).unwrap_or(Commit::Uncertain)
+        let outcome = outcome
+            .recv_timeout(REQUEST_TIMEOUT)
+            .unwrap_or(Commit::Uncertain);
+        self.ended = !matches!(outcome, Commit::Reanchor(_));
+        outcome
     }
 }
 
 impl Drop for LiveTyping {
     fn drop(&mut self) {
         if !self.ended {
-            self.mailbox.end(End::Cancel);
+            self.mailbox.request(Request::Cancel);
         }
     }
 }
 
 fn run(mailbox: Arc<Mailbox>, focus: Focus, window: isize, id: u64) {
-    let mut started = false;
-    if Focus::current() == Some(focus) {
-        match send(window, id, BEGIN, "") {
-            Response::Applied => started = true,
-            Response::Uncertain => {
-                send(window, id, CANCEL, "");
-            }
-            Response::Declined => {}
-        }
-    }
-    let mut abandoned = false;
+    let mut editor = Editor {
+        focus,
+        window,
+        id,
+        started: false,
+        abandoned: false,
+        shown: false,
+        last_applied: None,
+        point: EditPoint::default(),
+    };
+    editor.begin();
+    let mut retry = None;
     loop {
-        let (end, preview) = {
+        let (request, preview) = {
             let pending = mailbox
                 .pending
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            let mut pending = mailbox
-                .changed
-                .wait_while(pending, |pending| {
-                    pending.preview.is_none() && pending.end.is_none()
-                })
-                .unwrap_or_else(|error| error.into_inner());
-            (pending.end.take(), pending.preview.take())
+            let waiting =
+                |pending: &mut Pending| pending.preview.is_none() && pending.request.is_none();
+            let mut pending = if retry.is_some() {
+                mailbox
+                    .changed
+                    .wait_timeout_while(pending, SELECTION_RECHECK, waiting)
+                    .unwrap_or_else(|error| error.into_inner())
+                    .0
+            } else {
+                mailbox
+                    .changed
+                    .wait_while(pending, waiting)
+                    .unwrap_or_else(|error| error.into_inner())
+            };
+            (pending.request.take(), pending.preview.take())
         };
-        match end {
-            Some(End::Cancel) => {
-                if started {
-                    send(window, id, CANCEL, "");
-                }
+        match request {
+            Some(Request::Cancel) => {
+                editor.cancel();
                 break;
             }
-            Some(End::Commit(text, deadline, reply)) => {
-                let outcome = if Instant::now() >= deadline {
-                    if started {
-                        send(window, id, CANCEL, "");
+            Some(Request::Prepare(deadline, reply)) => {
+                retry = None;
+                if enough_time(deadline) {
+                    editor.prepare();
+                    let _ = reply.send(editor.point.clone());
+                }
+            }
+            Some(Request::Commit(text, deadline, reply)) => {
+                let outcome = editor.finish(&text, deadline);
+                let ended = !matches!(outcome, Commit::Reanchor(_));
+                if reply.send(outcome).is_err() {
+                    if !ended {
+                        editor.cancel();
                     }
-                    Commit::Uncertain
-                } else if abandoned {
-                    Commit::Copy
-                } else if !started {
-                    Commit::Paste
-                } else if Focus::current() != Some(focus) {
-                    send(window, id, CANCEL, "");
-                    Commit::Copy
-                } else {
-                    match send(window, id, COMMIT, &text) {
-                        Response::Applied => Commit::Inserted,
-                        Response::Declined => {
-                            send(window, id, CANCEL, "");
-                            Commit::Copy
-                        }
-                        Response::Uncertain => Commit::Uncertain,
-                    }
+                    break;
+                }
+                if ended {
+                    break;
+                }
+            }
+            None => {
+                let Some(preview) = preview.or(retry.take()) else {
+                    continue;
                 };
-                let _ = reply.send(outcome);
-                break;
-            }
-            None if started => {
-                if Focus::current() != Some(focus) {
-                    send(window, id, CANCEL, "");
-                    started = false;
-                    abandoned = true;
-                } else if let Some(preview) = preview {
-                    let _ = send(window, id, UPDATE, &preview);
+                if editor.preview(&preview, &mailbox) {
+                    retry = Some(preview);
                 }
             }
-            None => {}
         }
     }
+}
+
+struct Editor {
+    focus: Focus,
+    window: isize,
+    id: u64,
+    started: bool,
+    abandoned: bool,
+    shown: bool,
+    last_applied: Option<String>,
+    point: EditPoint,
+}
+
+impl Editor {
+    fn send(&self, operation: usize, text: &str) -> Response {
+        send(self.window, self.id, operation, text)
+    }
+
+    fn begin(&mut self) {
+        if Focus::current() != Some(self.focus) {
+            self.abandoned = true;
+            return;
+        }
+        match self.send(BEGIN, "") {
+            Response::Applied => self.started = true,
+            Response::Declined => {}
+            _ => self.abandoned = self.send(CANCEL, "") == Response::Uncertain,
+        }
+    }
+
+    fn cancel(&mut self) -> bool {
+        let started = std::mem::take(&mut self.started);
+        !started || self.send(CANCEL, "") == Response::Applied
+    }
+
+    fn focused(&mut self) -> bool {
+        if Focus::current() == Some(self.focus) {
+            return true;
+        }
+        self.cancel();
+        self.abandoned = true;
+        false
+    }
+
+    fn reanchor(&mut self) {
+        if let Some(shown) = self.last_applied.take() {
+            self.point.0 = Some(shown);
+        } else if self.point.0.is_none() {
+            self.point.0 = Some(String::new());
+        }
+    }
+
+    /// Checks for a manual change after the last preview so Output receives
+    /// only the speech that can still be replaced.
+    fn prepare(&mut self) {
+        if self.started && self.focused() && self.send(PROBE, "") == Response::Reanchor {
+            self.reanchor();
+        }
+    }
+
+    fn finish(&mut self, text: &str, deadline: Instant) -> Commit {
+        if !enough_time(deadline) {
+            self.cancel();
+            return Commit::Uncertain;
+        }
+        if self.abandoned || !self.focused() {
+            return Commit::Copy;
+        }
+        if self.point.0.is_none() && !self.shown {
+            // An older bridge or an ineligible textbox may never have owned
+            // any text. End its empty session before using ordinary paste.
+            if self.cancel() && Focus::current() == Some(self.focus) {
+                return Commit::Paste;
+            }
+            return Commit::Copy;
+        }
+        if !self.started {
+            return Commit::Copy;
+        }
+        match self.send(COMMIT, text) {
+            Response::Applied => Commit::Inserted,
+            Response::Reanchor => {
+                self.reanchor();
+                Commit::Reanchor(self.point.clone())
+            }
+            Response::Declined | Response::SelectionPending => {
+                self.cancel();
+                Commit::Copy
+            }
+            Response::Uncertain => {
+                self.cancel();
+                Commit::Uncertain
+            }
+        }
+    }
+
+    /// Returns true while a noncollapsed selection temporarily blocks these
+    /// words. The worker retries only with pending speech.
+    fn preview(&mut self, text: &str, mailbox: &Mailbox) -> bool {
+        if !self.started || !self.focused() {
+            return false;
+        }
+        for _ in 0..2 {
+            let Some(suffix) = self.point.suffix(text) else {
+                return false;
+            };
+            if self.last_applied.as_deref() == Some(text)
+                || (self.last_applied.is_none() && suffix.is_empty())
+            {
+                return false;
+            }
+            match self.send(UPDATE, suffix) {
+                Response::Applied => {
+                    if !self.shown && !suffix.is_empty() {
+                        mailbox.first_preview.store(true, Ordering::Release);
+                        self.shown = true;
+                    }
+                    self.last_applied = Some(text.to_owned());
+                    return false;
+                }
+                Response::Reanchor => self.reanchor(),
+                Response::SelectionPending => return true,
+                Response::Declined | Response::Uncertain => {
+                    self.cancel();
+                    self.abandoned = true;
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
+fn enough_time(deadline: Instant) -> bool {
+    deadline.saturating_duration_since(Instant::now())
+        > Duration::from_millis(u64::from(MESSAGE_MS))
 }
